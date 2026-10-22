@@ -1,0 +1,254 @@
+{
+ "summary": {
+  "a": "hog2",
+  "b": "general",
+  "deck": "hog26",
+  "games": 8,
+  "a_wins": 8,
+  "b_wins": 0,
+  "draws": 0,
+  "a_win_rate": 1.0,
+  "wilson95": [
+   0.6755843804891231,
+   1.0
+  ]
+ },
+ "games": [
+  {
+   "seed": 1400,
+   "a_team": 0,
+   "winner": 0,
+   "ticks": 6120,
+   "crowns": [
+    1,
+    0
+   ],
+   "plays": [
+    70,
+    71
+   ],
+   "rejected": [
+    8,
+    0
+   ],
+   "reasons": {
+    "10": 8
+   },
+   "unknown": {
+    "buff:Cannon_EV1_barrage_damage_buff": 4,
+    "area:None:38": 4
+   },
+   "seconds": 72.37275019999652,
+   "first_play": [
+    2410,
+    2415
+   ]
+  },
+  {
+   "seed": 1401,
+   "a_team": 1,
+   "winner": 1,
+   "ticks": 6130,
+   "crowns": [
+    0,
+    1
+   ],
+   "plays": [
+    77,
+    60
+   ],
+   "rejected": [
+    4,
+    0
+   ],
+   "reasons": {
+    "10": 4
+   },
+   "unknown": {
+    "area:None:38": 8,
+    "buff:Cannon_EV1_barrage_damage_buff": 2
+   },
+   "seconds": 111.27040380000835,
+   "first_play": [
+    2415,
+    2405
+   ]
+  },
+  {
+   "seed": 1402,
+   "a_team": 0,
+   "winner": 0,
+   "ticks": 6092,
+   "crowns": [
+    1,
+    0
+   ],
+   "plays": [
+    67,
+    73
+   ],
+   "rejected": [
+    4,
+    2
+   ],
+   "reasons": {
+    "10": 6
+   },
+   "unknown": {
+    "area:None:38": 6
+   },
+   "seconds": 110.64527389999421,
+   "first_play": [
+    2410,
+    2415
+   ]
+  },
+  {
+   "seed": 1403,
+   "a_team": 1,
+   "winner": 1,
+   "ticks": 6096,
+   "crowns": [
+    0,
+    1
+   ],
+   "plays": [
+    73,
+    68
+   ],
+   "rejected": [
+    0,
+    5
+   ],
+   "reasons": {
+    "10": 5
+   },
+   "unknown": {
+    "area:None:38": 4,
+    "buff:Cannon_EV1_barrage_damage_buff": 2
+   },
+   "seconds": 110.78786460000265,
+   "first_play": [
+    2410,
+    2405
+   ]
+  },
+  {
+   "seed": 1404,
+   "a_team": 0,
+   "winner": 0,
+   "ticks": 6117,
+   "crowns": [
+    1,
+    0
+   ],
+   "plays": [
+    68,
+    75
+   ],
+   "rejected": [
+    6,
+    1
+   ],
+   "reasons": {
+    "10": 7
+   },
+   "unknown": {
+    "area:None:38": 6
+   },
+   "seconds": 111.17100980000396,
+   "first_play": [
+    2410,
+    2415
+   ]
+  },
+  {
+   "seed": 1405,
+   "a_team": 1,
+   "winner": 1,
+   "ticks": 6123,
+   "crowns": [
+    0,
+    1
+   ],
+   "plays": [
+    65,
+    63
+   ],
+   "rejected": [
+    0,
+    0
+   ],
+   "reasons": {},
+   "unknown": {
+    "buff:Cannon_EV1_barrage_damage_buff": 8,
+    "area:None:38": 6
+   },
+   "seconds": 110.86146929999813,
+   "first_play": [
+    2415,
+    2405
+   ]
+  },
+  {
+   "seed": 1406,
+   "a_team": 0,
+   "winner": 0,
+   "ticks": 6129,
+   "crowns": [
+    1,
+    0
+   ],
+   "plays": [
+    72,
+    73
+   ],
+   "rejected": [
+    7,
+    0
+   ],
+   "reasons": {
+    "10": 7
+   },
+   "unknown": {
+    "buff:Cannon_EV1_barrage_damage_buff": 2,
+    "area:None:38": 2
+   },
+   "seconds": 110.91265610000119,
+   "first_play": [
+    2405,
+    2415
+   ]
+  },
+  {
+   "seed": 1407,
+   "a_team": 1,
+   "winner": 1,
+   "ticks": 6122,
+   "crowns": [
+    0,
+    1
+   ],
+   "plays": [
+    72,
+    71
+   ],
+   "rejected": [
+    0,
+    5
+   ],
+   "reasons": {
+    "10": 5
+   },
+   "unknown": {
+    "area:None:38": 8,
+    "buff:Cannon_EV1_barrage_damage_buff": 6
+   },
+   "seconds": 111.71012879999762,
+   "first_play": [
+    2415,
+    2405
+   ]
+  }
+ ]
+}

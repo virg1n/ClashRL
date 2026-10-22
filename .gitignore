@@ -1,0 +1,5 @@
+# local environments and checkouts (setup_ab.sh builds the env and clones FirstLight_CR itself)
+.venv/
+ext/
+__pycache__/
+*.pyc
