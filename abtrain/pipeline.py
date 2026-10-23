@@ -789,6 +789,10 @@ def write_status(sup: Supervisor | None = None) -> str:
                          f"{am.get('plays_per_game', 0):.1f}, first play {am.get('first_play_s')}, wins vs passive "
                          f"{am.get('wins_vs_passive_share', 0):.2f}, delay {am.get('delay_ticks', 0):.1f} ticks")
     lines += ["", "## Against the real FirstLight General", ""]
+    cur = read_json(RUNS / "eval" / "current.json", None)
+    if cur and not (RUNS / "eval" / "DONE").exists():
+        lines.append(f"- now screening: {cur['run']} {cur['label']} ({cur['games']} games: {', '.join(cur['suites'])}), "
+                     f"started {time.strftime('%H:%M', time.localtime(cur['started']))}")
     base = read_json(RUNS / "eval" / "fl_baseline.json", None)
     if base:
         lines.append("- FL Hog 2 vs FL General in this simulator (the bar): "

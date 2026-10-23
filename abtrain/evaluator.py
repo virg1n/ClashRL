@@ -87,6 +87,10 @@ class Evaluator:
         prim = PRIMARY[run]
         seed = _seed(path)
         t0 = time.time()
+        games = cfg["fl_eval_games"] + (len(SUITES[run]) - 1) * max(2, cfg["fl_eval_games"] // 2)
+        log(f"now screening {run} {label} ({games} games: {', '.join(SUITES[run])})", NAME)
+        atomic_write_json(EV / "current.json", {"run": run, "label": label, "suites": list(SUITES[run]),
+                                                "games": games, "started": t0})
         res = {"run": run, "label": label, "path": str(path), "time": time.time(), "decode": "t05",
                "suites": list(SUITES[run]), "version": VERSIONS[run]}
         for k, suite in enumerate(SUITES[run]):
@@ -112,6 +116,9 @@ class Evaluator:
         if wr < cfg["promote_gate"] or wr < best - 0.03:
             return
         seed = _seed(path) + 7
+        log(f"now playing {cfg['fl_promo_games']} promotion games for {run} {path.stem} ({wr:.3f} on {prim})", NAME)
+        atomic_write_json(EV / "current.json", {"run": run, "label": f"{path.stem} promotion check", "suites": [prim],
+                                                "games": cfg["fl_promo_games"], "started": time.time()})
         more = self.play(str(path), prim, cfg["fl_promo_games"], "t05", seed)
         wins = res[prim]["wins"] + more["wins"]
         n = res[prim]["games"] + more["games"]
@@ -199,6 +206,9 @@ class Evaluator:
         n = self.cfg["fl_baseline_games"]
         if not base or (isinstance(base.get("hog_vs_focus"), dict) and base["hog_vs_focus"].get("games", 0) >= n):
             return
+        log(f"now measuring the FL Hog 2 bar on hog_vs_focus ({n} games)", NAME)
+        atomic_write_json(EV / "current.json", {"run": "FL Hog 2", "label": "baseline", "suites": ["hog_vs_focus"],
+                                                "games": n, "started": time.time()})
         tasks = eval_tasks(fl("hog2"), fl("general"), "hog_vs_focus", n, 4243)
         res = summarize(self.pool.run(tasks, progress=lambda i, n: _beat()))
         if res["errors"]:
