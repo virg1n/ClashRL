@@ -364,21 +364,68 @@ def visible_gpus() -> list[int]:
 # ----------------------------------------------------------------------------- suites
 
 
-def suite_decks(suite: str, n_pairs: int, seed: int) -> list[tuple[str, str]]:
-    from .game import HOG26, Catalog, deck_key, make_engine
-    from .league import focus_decks
+# suite -> (candidate's decks, opponent's decks, opponent FirstLight model)
+#   hog26         Hog 2.6 mirror                                      vs FL General
+#   mixed         the same FirstLight focus deck on both sides        vs FL General
+#   pop_vs_focus  a popular human deck  vs a FirstLight focus deck    vs FL General
+#   pop_vs_hog2   a popular human deck  vs Hog 2.6                    vs FL Hog 2 (the Hog specialist)
+#   hog_vs_focus  Hog 2.6               vs a FirstLight focus deck    vs FL General
+SUITE_OPP = {"pop_vs_hog2": "hog2"}
 
+
+def suite_opponent(suite: str) -> str:
+    return SUITE_OPP.get(suite, "general")
+
+
+_FL_CARDS: frozenset | None = None
+
+
+def _fl_known_cards() -> frozenset:
+    """RoyaleSim card ids FirstLight can name (its seats track both decks)."""
+    global _FL_CARDS
+    if _FL_CARDS is None:
+        _paths()
+        from flport.catalog import Catalog as FLCatalog
+
+        from .game import make_engine
+
+        _FL_CARDS = frozenset(FLCatalog.build(make_engine()).fl_card_by_rs)
+    return _FL_CARDS
+
+
+def suite_decks(suite: str, n_pairs: int, seed: int) -> list[tuple[str, str]]:
+    """(candidate deck, opponent deck) per seat-swapped pair."""
+    from .game import HOG26, Catalog, deck_key, make_engine, parse_deck_key
+    from .league import DeckBook, focus_decks
+
+    hog = deck_key(HOG26)
     if suite == "hog26":
-        return [(deck_key(HOG26), deck_key(HOG26))] * n_pairs
+        return [(hog, hog)] * n_pairs
     rng = np.random.default_rng(seed)
-    focus = focus_decks(Catalog.build(make_engine()))
+    cat = Catalog.build(make_engine())
+    focus = focus_decks(cat)
     if not focus:
         raise RuntimeError("FirstLight focus decks are not available")
-    out = []
-    for i in range(n_pairs):
-        d = focus[int(rng.integers(len(focus)))] if i >= len(focus) else focus[(seed + i) % len(focus)]
-        out.append((d, d))
-    return out
+
+    def focus_at(i):  # every focus deck once before any repeats
+        return focus[int(rng.integers(len(focus)))] if i >= len(focus) else focus[(seed + i) % len(focus)]
+
+    if suite == "mixed":
+        return [(focus_at(i), focus_at(i)) for i in range(n_pairs)]
+    if suite == "hog_vs_focus":
+        return [(hog, focus_at(i)) for i in range(n_pairs)]
+    if suite in ("pop_vs_focus", "pop_vs_hog2"):
+        known = _fl_known_cards()
+        book = DeckBook(cat, rng)
+        out = []
+        for i in range(n_pairs):
+            for _ in range(200):  # popularity-weighted human deck FirstLight can also name
+                d = book.popular()
+                if all(cat.ids[n] in known for n, _ in parse_deck_key(d)):
+                    break
+            out.append((d, focus_at(i) if suite == "pop_vs_focus" else hog))
+        return out
+    raise ValueError(f"unknown suite {suite}")
 
 
 def eval_tasks(cand: dict, opp: dict, suite: str, games: int, seed: int) -> list[dict]:
@@ -558,8 +605,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("eval")
     e.add_argument("--ckpt", required=True)
-    e.add_argument("--opp", default="general")
-    e.add_argument("--suite", default="hog26", choices=["hog26", "mixed"])
+    e.add_argument("--opp", default="")
+    e.add_argument("--suite", default="hog26", choices=["hog26", "mixed", "pop_vs_focus", "pop_vs_hog2", "hog_vs_focus"])
     e.add_argument("--games", type=int, default=40)
     e.add_argument("--decode", default="t05")
     e.add_argument("--seed", type=int, default=5)
@@ -567,6 +614,7 @@ def main(argv=None):
     e.add_argument("--out", required=True)
     b = sub.add_parser("baseline")
     b.add_argument("--games", type=int, default=0)
+    b.add_argument("--suites", default="hog26,mixed,hog_vs_focus")
     b.add_argument("--workers", type=int, default=0)
     b.add_argument("--out", required=True)
     r = sub.add_parser("record")
@@ -582,13 +630,15 @@ def main(argv=None):
     pool = FLPool(workers, gpus)
     try:
         if a.cmd == "eval":
-            tasks = eval_tasks(ours(a.ckpt, a.decode), fl(a.opp), a.suite, a.games, a.seed)
+            tasks = eval_tasks(ours(a.ckpt, a.decode), fl(a.opp or suite_opponent(a.suite)), a.suite, a.games, a.seed)
             res = summarize(pool.run(tasks))
-            res.update({"ckpt": a.ckpt, "opp": a.opp, "suite": a.suite, "decode": a.decode})
+            res.update({"ckpt": a.ckpt, "opp": a.opp or suite_opponent(a.suite), "suite": a.suite, "decode": a.decode})
         else:
             n = a.games or cfg["fl_baseline_games"]
-            res = {}
-            for suite in ("hog26", "mixed"):
+            res = read_json(Path(a.out), {}) or {}
+            for suite in a.suites.split(","):
+                if isinstance(res.get(suite), dict) and not res[suite].get("errors"):
+                    continue  # already measured
                 tasks = eval_tasks(fl("hog2"), fl("general"), suite, n, 4242)
                 res[suite] = summarize(pool.run(tasks, progress=lambda i, t: i % 10 == 0 and log(
                     f"baseline {suite}: {i}/{t}", "fleval")))
