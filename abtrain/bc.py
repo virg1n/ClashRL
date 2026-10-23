@@ -197,6 +197,20 @@ class WindowStream(torch.utils.data.IterableDataset):
             epoch += 1
 
 
+def held_out_hog_shards(root: Path, rels: list[str]) -> list[str]:
+    """Shards with at least one held-out sequence of a Hog 2.6 match (reads only seq_meta)."""
+    out = []
+    for rel in rels:
+        try:
+            with np.load(root / rel) as z:
+                meta = z["seq_meta"]
+            if ((meta[:, 7] == 1) & (meta[:, 5] == 1)).any():
+                out.append(rel)
+        except Exception as exc:
+            log(f"skipping shard {rel}: {exc!r}", "bc")
+    return out or rels[:1]
+
+
 def make_loader(ds, workers: int):
     return torch.utils.data.DataLoader(ds, batch_size=None, num_workers=workers, pin_memory=True,
                                        prefetch_factor=4 if workers else None, persistent_workers=bool(workers))
@@ -310,7 +324,10 @@ def main(argv=None):
     ds = WindowStream(train_rels, root, rank, world, batch, window, burn, "train", select,
                       cfg["awbc_B_general_frac"] if a.mode == "awbc_B" else 0.0, with_adv, cfg["awbc_n"],
                       a.seed, general_shards=gen_rels if a.mode == "awbc_B" else None)
-    val_rels = hog_rels if a.mode == "awbc_B" else rels
+    val_rels = rels
+    if a.mode == "awbc_B":  # only shards that hold held-out Hog matches (rare): a validation pass
+        val_rels = held_out_hog_shards(root, hog_rels)  # over all Hog shards outlasts the hang limit
+        say(f"{len(val_rels)} of {len(hog_rels)} Hog shards contain held-out Hog matches")
     vds = WindowStream(val_rels, root, rank, world, batch, window, burn, "val",
                        "hog" if a.mode == "awbc_B" else "all", 0.0, False, cfg["awbc_n"], a.seed + 7)
     loader = make_loader(ds, workers)
