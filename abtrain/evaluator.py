@@ -51,6 +51,8 @@ class Evaluator:
         self.cfg = settings()
         EV.mkdir(parents=True, exist_ok=True)
         self.done = read_json(EV / "evaluated.json", {}) or {}
+        # checkpoints whose screen could not complete get another try after a restart
+        self.done = {k: v for k, v in self.done.items() if not str(v).endswith("(incomplete)")}
         self.state = {r: read_json(EV / f"{r}_state.json", None) or {"best": None, "history": [], "improving": True,
                                                                       "promotions": []} for r in ("A", "B")}
         gpus = visible_gpus()

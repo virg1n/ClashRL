@@ -158,6 +158,11 @@ class FLSeat:
         from flport.agent import FirstLightSeat
 
         self.seat = FirstLightSeat(team, _fl_policy(name), scene, sample=sample, device=_W["device"])
+        # FirstLight's batch-1 CUDA graph is shared per model and device inside a process; one
+        # failed capture (seen with torch 2.14 / CUDA 13) leaves it half-built and every later
+        # decision raises "V4 CUDA Graph storage is incomplete". The plain forward pass makes the
+        # same argmax decisions.
+        self.seat.session._cuda_graph = None
         self.team = team
         self.force_first = force_first
         self.stats = self.seat.stats
