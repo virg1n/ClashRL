@@ -11,8 +11,7 @@ half as many each.
   A (generalist): mixed (FL focus decks mirrored, vs FL General; primary), pop_vs_focus (A on
      a popular human deck vs FL General on a focus deck), pop_vs_hog2 (A on a popular human
      deck vs FL Hog 2 on Hog 2.6)
-  B (Hog specialist): hog26 (Hog 2.6 mirror vs FL General; primary), hog_vs_focus (B on
-     Hog 2.6 vs FL General on a focus deck)
+  B (Hog specialist): hog_vs_focus (B on Hog 2.6 vs FL General on a focus deck; primary)
 The stage-1/2 checkpoints are screened first, as the starting point.
 
 Promotion: a screen at or above the gate (``promote_gate``) and within 3 points of the best
@@ -39,9 +38,10 @@ from .flmatch import FLPool, eval_tasks, fl, ours, suite_opponent, summarize, vi
 
 EV = RUNS / "eval"
 NAME = "evaluator"
-SUITES = {"A": ("mixed", "pop_vs_focus", "pop_vs_hog2"), "B": ("hog26", "hog_vs_focus")}
+SUITES = {"A": ("mixed", "pop_vs_focus", "pop_vs_hog2"), "B": ("hog_vs_focus",)}
 PRIMARY = {r: s[0] for r, s in SUITES.items()}
-EVAL_VERSION = 2  # bumped when the suites change: stage-2 references are screened again
+# bumped per run when its suites change: that run's stage-2 reference is screened again
+VERSIONS = {"A": 2, "B": 3}
 
 
 def _snapshots(run: str) -> list[Path]:
@@ -61,6 +61,9 @@ class Evaluator:
         self.done = {k: v for k, v in self.done.items() if not str(v).endswith("(incomplete)")}
         self.state = {r: read_json(EV / f"{r}_state.json", None) or {"best": None, "history": [], "improving": True,
                                                                       "promotions": []} for r in ("A", "B")}
+        for r, st in self.state.items():  # a best or a trend measured on another main suite no longer applies
+            if st.get("best") and st["best"].get("suite") != PRIMARY[r]:
+                st["best"], st["history"], st["improving"] = None, [], True
         gpus = visible_gpus()
         self.pool = FLPool(self.cfg["fl_eval_workers"], gpus)
         self.turn = 0
@@ -85,7 +88,7 @@ class Evaluator:
         seed = _seed(path)
         t0 = time.time()
         res = {"run": run, "label": label, "path": str(path), "time": time.time(), "decode": "t05",
-               "suites": list(SUITES[run]), "version": EVAL_VERSION}
+               "suites": list(SUITES[run]), "version": VERSIONS[run]}
         for k, suite in enumerate(SUITES[run]):
             games = cfg["fl_eval_games"] if k == 0 else max(2, cfg["fl_eval_games"] // 2)
             res[suite] = self.play(str(path), suite, games, "t05", seed + k)
@@ -95,8 +98,8 @@ class Evaluator:
             res["decisions"] = None
         res["primary"] = prim
         res["minutes"] = (time.time() - t0) / 60
-        rest = ", ".join(f"{s} {res[s]['win_rate']:.3f} ({res[s]['games']})" for s in SUITES[run][1:])
-        log(f"screen {run} {label}: {prim} {res[prim]['win_rate']:.3f} ({res[prim]['games']} games), {rest}, "
+        rest = "".join(f"{s} {res[s]['win_rate']:.3f} ({res[s]['games']}), " for s in SUITES[run][1:])
+        log(f"screen {run} {label}: {prim} {res[prim]['win_rate']:.3f} ({res[prim]['games']} games), {rest}"
             f"plays/game {res[prim]['plays_per_game']:.1f}, {res['minutes']:.1f} min", NAME)
         return res
 
@@ -165,16 +168,16 @@ class Evaluator:
                                    or np.mean(scores[-2:]) > np.mean(scores[-4:-2]) + 1e-9)
         st["latest"] = {"label": res["label"], "decisions": res.get("decisions"),
                         **{s: res[s] for s in SUITES[run]}}
-        self.done[self._key(Path(res["path"]))] = res["label"]
+        self.done[self._key(Path(res["path"]), run)] = res["label"]
         self.save()
 
-    def _key(self, path: Path) -> str:
-        return f"{path}@{path.stat().st_mtime_ns}@v{EVAL_VERSION}"
+    def _key(self, path: Path, run: str) -> str:
+        return f"{path}@{path.stat().st_mtime_ns}@v{VERSIONS[run]}"
 
-    def _seen(self, path: Path, any_version: bool = True) -> bool:
+    def _seen(self, path: Path, run: str, any_version: bool = True) -> bool:
         """Snapshots screened under any suite version stay done; references (stage 1/2) are
         screened again once with new suites (``any_version=False``)."""
-        if self._key(path) in self.done:
+        if self._key(path, run) in self.done:
             return True
         base = f"{path}@{path.stat().st_mtime_ns}"
         return any_version and any(k == base or k.startswith(base + "@v") for k in self.done)
@@ -184,18 +187,19 @@ class Evaluator:
         for run, label, path, rescreen in (("A", "stage1", RUNS / "bc1" / "final.pt", False),
                                            ("A", "stage2", RUNS / "awbc_A" / "final.pt", True),
                                            ("B", "stage2", RUNS / "awbc_B" / "final.pt", True)):
-            if path.exists() and not self._seen(path, any_version=not rescreen):
+            if path.exists() and not self._seen(path, run, any_version=not rescreen):
                 return run, path, label
         return None
 
     def baseline_extra(self) -> None:
-        """FL Hog 2 in B's second setting (Hog 2.6 vs FL General on focus decks), once: the bar
-        for ``hog_vs_focus``. The original baseline covers hog26 and mixed."""
+        """FL Hog 2 in B's setting (Hog 2.6 vs FL General on focus decks), once, with as many
+        games as the other baselines: the bar for ``hog_vs_focus``."""
         path = EV / "fl_baseline.json"
         base = read_json(path, {}) or {}
-        if isinstance(base.get("hog_vs_focus"), dict) or not base:
+        n = self.cfg["fl_baseline_games"]
+        if not base or (isinstance(base.get("hog_vs_focus"), dict) and base["hog_vs_focus"].get("games", 0) >= n):
             return
-        tasks = eval_tasks(fl("hog2"), fl("general"), "hog_vs_focus", self.cfg["fl_eval_games"], 4243)
+        tasks = eval_tasks(fl("hog2"), fl("general"), "hog_vs_focus", n, 4243)
         res = summarize(self.pool.run(tasks, progress=lambda i, n: _beat()))
         if res["errors"]:
             log(f"baseline hog_vs_focus incomplete ({res['errors']} errors); trying again later", NAME)
@@ -209,7 +213,7 @@ class Evaluator:
         for k in range(2):
             run = ("A", "B")[(self.turn + k) % 2]
             snaps = _snapshots(run)
-            if snaps and not self._seen(snaps[-1]):
+            if snaps and not self._seen(snaps[-1], run):
                 self.turn = (self.turn + k + 1) % 2
                 return run, snaps[-1]
         return None
@@ -221,7 +225,7 @@ class Evaluator:
             if not run_finished(run):
                 return False
             snaps = _snapshots(run)
-            if snaps and not self._seen(snaps[-1]):
+            if snaps and not self._seen(snaps[-1], run):
                 return False
         return True
 
@@ -262,7 +266,7 @@ class Evaluator:
                     self.failures = 0
                     append_jsonl(EV / f"{run}.jsonl", {"run": run, "label": label, "path": str(path),
                                                         "time": time.time(), "incomplete": str(exc)})
-                    self.done[self._key(path)] = label + " (incomplete)"
+                    self.done[self._key(path, run)] = label + " (incomplete)"
                     self.save()
                 continue
             self.failures = 0

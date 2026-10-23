@@ -614,7 +614,7 @@ def main(argv=None):
     e.add_argument("--out", required=True)
     b = sub.add_parser("baseline")
     b.add_argument("--games", type=int, default=0)
-    b.add_argument("--suites", default="hog26,mixed,hog_vs_focus")
+    b.add_argument("--suites", default="mixed,hog_vs_focus")
     b.add_argument("--workers", type=int, default=0)
     b.add_argument("--out", required=True)
     r = sub.add_parser("record")
