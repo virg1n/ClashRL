@@ -26,6 +26,8 @@ def _deck_fn(kind: str, cat, rng):
     book = DeckBook(cat, rng)
     if kind == "hog26":
         return lambda: (deck_key(HOG26), deck_key(HOG26)), book
+    if kind == "hog_vs_popular":  # a on Hog 2.6, b on a popularity-weighted human deck
+        return lambda: (deck_key(HOG26), book.popular()), book
     if kind == "focus":
         def f():
             d = book.focus_deck()
@@ -147,7 +149,7 @@ def main(argv=None):
     ap.add_argument("--a", required=True)
     ap.add_argument("--b", required=True)
     ap.add_argument("--games", type=int, default=0)
-    ap.add_argument("--decks", default="popular", choices=["popular", "hog26", "focus"])
+    ap.add_argument("--decks", default="popular", choices=["popular", "hog26", "focus", "hog_vs_popular"])
     ap.add_argument("--decode", default="sample")
     ap.add_argument("--delay", type=int, default=0)
     ap.add_argument("--workers", type=int, default=8)

@@ -24,6 +24,7 @@ play after 15 s, so the stand-ins are not only passive.
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import os
 import sys
@@ -122,7 +123,7 @@ class OurSeat:
         self.dev = next(model.parameters()).device
         self.state = model.initial_state(1, self.dev)
         self.queue: list[tuple[int, object]] = []
-        self.stats = {"plays": 0, "first_play_tick": None}
+        self.stats = {"plays": 0, "first_play_tick": None, "curve": []}  # curve: (tick, P(win), P(loss))
         self.torch = torch
 
     def act(self, tick: int, state) -> list:
@@ -136,7 +137,9 @@ class OurSeat:
                 setattr(o, k, getattr(o, k).astype(np.float16).astype(np.float32))
             with self.torch.no_grad(), self.torch.autocast(device_type=self.dev.type, dtype=self.torch.bfloat16,
                                                            enabled=self.dev.type == "cuda"):
-                lab, _lp, _v, _vl, self.state = self.model.act(batch_obs([o], self.dev), self.state, **self.dec)
+                lab, _lp, _v, vl, self.state = self.model.act(batch_obs([o], self.dev), self.state, **self.dec)
+            pr = vl[0].float().softmax(-1).tolist()
+            self.stats["curve"].append((tick, pr[0], pr[2], [int(p.crowns) for p in state.players]))
             lab = lab[0].tolist()
             for j in (0, 1):
                 c, t, d = lab[3 * j : 3 * j + 3]
@@ -204,7 +207,14 @@ def play_game(task: dict) -> dict:
         forms.append([f for _, f in dk])
     if hasattr(eng, "set_command_delay_ticks"):
         eng.set_command_delay_ticks(0)
-    eng.reset(seed, MatchSetup(decks=decks, forms=forms, shuffle=ShuffleMode.NONE))
+    setup = MatchSetup(decks=decks, forms=forms, shuffle=ShuffleMode.NONE)
+    eng.reset(seed, setup)
+    rec_trace = None
+    if task.get("trace"):  # a RoyaleGym trace for royaleviser / render_video.py, one frame per tick
+        from royalegym.replay import ReplayRecorder
+
+        rec_trace = ReplayRecorder(frame_every_tick=True)
+        rec_trace.begin(eng, seed, setup)
     state = eng.state()
     scene = Scene(_W["flcat"], _W["bundle"], decks=decks, forms=forms, arena=eng.arena(), episode_id=f"ab-{seed}")
     scene.ingest(state)
@@ -237,6 +247,9 @@ def play_game(task: dict) -> dict:
         evo_ready = [{int(x[0]) for x in state.players[t].evo if len(x) > 2 and x[2]} for t in (0, 1)]
         hands = [list(state.players[t].hand) for t in (0, 1)]
         results = eng.step(commands, 1)
+        if rec_trace is not None:
+            rec_trace.record_frame(eng)
+            rec_trace.record_step(tick, 1, commands, results)
         played = []
         for cmd, res in zip(commands, results):
             if res.status != DeployStatus.OK:
@@ -304,7 +317,15 @@ def play_game(task: dict) -> dict:
         else:
             plays.append(seat.stats["plays"] + seat.stats.get("abilities", 0))
             first.append(seat.stats.get("first_play_tick"))
+    if rec_trace is not None:
+        from royalegym.replay import save_trace
+
+        rec_trace.end(eng)
+        Path(task["trace"]).parent.mkdir(parents=True, exist_ok=True)
+        save_trace(rec_trace.trace, task["trace"])
+    curves = {t: seat.stats["curve"] for t, seat in enumerate(seats) if isinstance(seat, OurSeat)}
     out = {"seed": seed, "winner": w, "ticks": int(state.tick), "crowns": [state.players[0].crowns, state.players[1].crowns],
+           "curves": curves,
            "plays": plays, "first_play": first, "rejected": rejected, "seconds": time.time() - t0,
            "meta": task.get("meta", {})}
     if recs:
@@ -600,6 +621,62 @@ def record(workers: int, games: int, gpus: list[int], per_chunk: int = RECORD_PE
 # ----------------------------------------------------------------------------- CLI
 
 
+def _deck_arg(text: str) -> str:
+    """hog26, focus:N (FirstLight focus deck N), popular:N (N-th most played human deck) or a deck key."""
+    from .game import HOG26, Catalog, deck_key, make_engine, parse_deck_key
+    from .league import focus_decks
+
+    if text == "hog26":
+        return deck_key(HOG26)
+    kind, _, num = text.partition(":")
+    if kind == "focus":
+        return focus_decks(Catalog.build(make_engine()))[int(num)]
+    if kind == "popular":
+        from .league import DeckBook
+
+        cat = Catalog.build(make_engine())
+        known = _fl_known_cards()
+        keys = [k for k in DeckBook(cat, np.random.default_rng(0)).pop_keys
+                if all(cat.ids[n] in known for n, _ in parse_deck_key(k))]
+        return keys[int(num)]
+    return text
+
+
+def trace_battle(a, gpus: list[int]) -> None:
+    """One recorded battle: blue = team 0 (bottom), red = team 1 (top)."""
+    def side(spec):
+        return fl(spec[3:]) if spec.startswith("fl:") else ours(spec, a.decode)
+
+    _init(_CTX.Value("i", 0), gpus)
+    decks = [_deck_arg(a.blue_deck), _deck_arg(a.red_deck)]
+    res = play_game({"seed": a.seed, "decks": decks, "sides": [side(a.blue), side(a.red)], "trace": a.out})
+    names = [a.blue, a.red]
+    w = res["winner"]
+    info = {"blue": names[0], "red": names[1], "blue_deck": decks[0], "red_deck": decks[1], "seed": a.seed,
+            "winner": ("blue" if w == 0 else "red" if w == 1 else "draw"), "crowns": res["crowns"],
+            "ticks": res["ticks"], "plays": res["plays"], "trace": a.out}
+    # render_video.py --eval: P(blue wins) per tick, from blue's own win-probability head when
+    # blue is one of ours, else 1 - red's estimate
+    def blue_p(team, p, q):  # P(blue wins) among decisive outcomes, from one head's (win, loss)
+        pb = p / max(1e-6, p + q)
+        return pb if team == 0 else 1.0 - pb
+
+    curve = None
+    heads = {t: {c[0]: c for c in res["curves"][t]} for t in res["curves"]}
+    if heads:
+        ticks = sorted(set().union(*[set(h) for h in heads.values()]))
+        curve = []
+        for tick in ticks:
+            vals = [blue_p(t, h[tick][1], h[tick][2]) for t, h in heads.items() if tick in h]
+            crowns = next(h[tick][3] for h in heads.values() if tick in h)
+            curve.append({"tick": tick, "p_blue": round(sum(vals) / len(vals), 4), "crowns": crowns})
+    out = Path(a.out)
+    out.with_suffix(".json").write_text(json.dumps(info, indent=1))
+    if curve:
+        out.with_name(out.stem + "_eval.json").write_text(json.dumps({"eval": curve}))
+    print(json.dumps(info))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -617,12 +694,23 @@ def main(argv=None):
     b.add_argument("--suites", default="mixed,hog_vs_focus")
     b.add_argument("--workers", type=int, default=0)
     b.add_argument("--out", required=True)
+    t = sub.add_parser("trace", help="record one battle for a video (render with render_video.py)")
+    t.add_argument("--blue", required=True, help="checkpoint path, or fl:general / fl:hog2")
+    t.add_argument("--red", required=True)
+    t.add_argument("--blue-deck", default="hog26", help="deck key, or hog26 / focus:N / popular:N")
+    t.add_argument("--red-deck", default="hog26")
+    t.add_argument("--decode", default="argmax")
+    t.add_argument("--seed", type=int, default=1)
+    t.add_argument("--out", required=True, help=".msgpack trace; a .json with the result and P(win) curve goes next to it")
     r = sub.add_parser("record")
     r.add_argument("--workers", type=int, default=0)
     r.add_argument("--games", type=int, default=0)
     a = ap.parse_args(argv)
     cfg = settings()
     gpus = visible_gpus()
+    if a.cmd == "trace":
+        trace_battle(a, gpus)
+        return
     if a.cmd == "record":
         record(a.workers or cfg["fl_record_workers"], a.games or cfg["fl_record_max_games"], gpus)
         return
