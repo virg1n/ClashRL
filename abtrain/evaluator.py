@@ -141,6 +141,8 @@ class Evaluator:
         ck = torch_load(path)
         sd = ck["model"] if "model" in ck else ck
         tag = f"{run}_{path.stem[5:]}"
+        for old in (LEAGUE / "promoted").glob(f"{run}_*.pt"):  # one promoted copy per run: the current best
+            old.unlink(missing_ok=True)
         torch_save_atomic({"model": {k: v.half() for k, v in sd.items()}, "run": run}, LEAGUE / "promoted" / f"{tag}.pt")
         info = {"run": run, "source": str(path), "decisions": res.get("decisions"), "suite": prim,
                 "opponent": "FirstLight General (argmax)", "win_rate": pooled, "games": n, "wilson95": [lo, hi],
@@ -175,7 +177,10 @@ class Evaluator:
                                    or np.mean(scores[-2:]) > np.mean(scores[-4:-2]) + 1e-9)
         st["latest"] = {"label": res["label"], "decisions": res.get("decisions"),
                         **{s: res[s] for s in SUITES[run]}}
-        self.done[self._key(Path(res["path"]), run)] = res["label"]
+        try:
+            self.done[self._key(Path(res["path"]), run)] = res["label"]
+        except FileNotFoundError:  # pruned meanwhile; screened anyway
+            self.done[f"{res['path']}@pruned@v{VERSIONS[run]}"] = res["label"]
         self.save()
 
     def _key(self, path: Path, run: str) -> str:

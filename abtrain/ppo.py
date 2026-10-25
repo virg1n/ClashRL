@@ -271,7 +271,13 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
                     net = policy
                 else:
                     o = league.opps.get(key)
-                    net = cache.get(key, o["path"], active) if o else policy
+                    try:
+                        net = cache.get(key, o["path"], active) if o else policy
+                    except (OSError, RuntimeError, KeyError) as exc:  # e.g. a snapshot pruned since the last scan
+                        log(f"opponent {key} unavailable ({exc!r}); current policy plays that seat", name)
+                        league.opps.pop(key, None)
+                        league.last_scan = 0.0
+                        net = policy
                 ks = torch.tensor([k for k, _ in seats], device=dev)
                 ss = torch.tensor([s for _, s in seats], device=dev)
                 bt = batch_obs([obs[k][s] for k, s in seats], dev)
@@ -474,6 +480,11 @@ def learner_main(run: str, gpu: int, init: str, stop):
         sdict = {k: v.detach().cpu().half() for k, v in model.state_dict().items()}
         torch_save_atomic({"model": sdict, "decisions": st["decisions"], "run": run}, LEAGUE / run / f"snap_{tag}.pt")
         log(f"league snapshot {tag}", name)
+        from .league import prune_snapshots
+
+        gone = prune_snapshots(run, cfg["keep_latest_snapshots"], cfg["keep_best_snapshots"])
+        if gone:
+            log(f"pruned snapshots {gone}", name)
 
     for f in glob.glob(str(sd / "rollouts" / "*.npz")):  # stale rollouts from before a restart
         os.remove(f)
@@ -485,7 +496,10 @@ def learner_main(run: str, gpu: int, init: str, stop):
             from .common import SHARDS
 
             idx = read_json(SHARDS.parent / "index.json", {})
-            hog = [s["path"] for s in idx.get("shards", []) if s["hog_steps"] > 0]
+            root = data_root()
+            hog = [s["path"] for s in idx.get("shards", []) if s["hog_steps"] > 0 and (root / s["path"]).exists()]
+            if not hog:
+                log("BC auxiliary loss off: no human Hog shards on disk", name)
             if hog:
                 ds = WindowStream(hog, data_root(), 0, 1, 16, 80, 16, "train", "hog", seed=st["iteration"] + 3)
                 aux_iter = iter(make_loader(ds, 2))
@@ -591,9 +605,13 @@ def learner_main(run: str, gpu: int, init: str, stop):
                     del o, loss
                 if finite and not warm and aux_iter is not None and aux_coef > 0:
                     # B: human Hog BC auxiliary loss, its own backward so both graphs are never alive at once
-                    hb = to_device_batch(next(aux_iter), dev)
-                    n_h = hb["glob"].shape[0]
-                    for sub in micro_splits(hb, token_budget):
+                    try:
+                        hb = to_device_batch(next(aux_iter), dev)
+                    except StopIteration:  # no human Hog windows left to read: the loss stops
+                        log("BC auxiliary data exhausted: auxiliary loss off", name)
+                        aux_iter, hb = None, None
+                    n_h = hb["glob"].shape[0] if hb is not None else 1
+                    for sub in (micro_splits(hb, token_budget) if hb is not None else []):
                         with torch.autocast(**amp):
                             ho = model.evaluate(sub, need_value=False)
                         aux = aux_coef * bc_losses(ho, sub, cfg["gate_pos_weight"])["total"] * (sub["glob"].shape[0] / n_h)

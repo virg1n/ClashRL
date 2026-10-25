@@ -42,7 +42,7 @@ HF_REVISION = "059d43a02138a34b1b3009cc2acc7630fb99a638"
 # Every tunable number in one place. ``WORK/config.json`` overrides any key (flat dict).
 DEFAULTS: dict[str, Any] = {
     # wall clock: the whole pipeline stops cleanly this many hours after the first start
-    "deadline_hours": 66.0,
+    "deadline_hours": 128.0,  # 66 h planned + 2 days added after the 24 Oct stop (60 GiB home quota)
     # stage 0 extraction
     "extract_workers": 46,
     "extract_limit_tasks": 0,  # tests only: 0 = every task
@@ -116,6 +116,8 @@ DEFAULTS: dict[str, Any] = {
     "max_decisions_A": 2_000_000_000,  # in practice the deadline ends PPO
     "max_decisions_B": 2_000_000_000,
     "snapshot_every": 2_000_000,
+    "keep_latest_snapshots": 3,  # per run, on disk: the newest snapshots ...
+    "keep_best_snapshots": 2,  # ... plus the best by FirstLight screen (home quota is 60 GiB)
     "delay_ramp_frac": 0.2,
     "live_delay_ticks": 21,
     "b_bc_aux_coef": 0.2,

@@ -47,6 +47,37 @@ def focus_decks(cat) -> list[str]:
         return []
 
 
+def prune_snapshots(run: str, keep_latest: int, keep_best: int) -> list[str]:
+    """Keep the newest ``keep_latest`` snapshots of ``run`` plus the ``keep_best`` with the best
+    FirstLight result (promotion games when played, else the screen's primary suite); delete the
+    rest. Returns the deleted file names."""
+    snaps = sorted((LEAGUE / run).glob("snap_*.pt"))
+    if len(snaps) <= keep_latest + keep_best:
+        return []
+    scores: dict[str, float] = {}
+    try:
+        with open(RUNS / "eval" / f"{run}.jsonl", encoding="utf-8") as fh:
+            for line in fh:
+                d = json.loads(line)
+                prim = d.get("primary") or (d.get("suites") or [None])[0]
+                if "incomplete" in d or prim not in d:
+                    continue
+                score = (d.get("promotion") or d[prim])["win_rate"]
+                name = Path(d["path"]).name
+                scores[name] = max(score, scores.get(name, 0.0))
+    except OSError:
+        pass
+    keep = set(snaps[-keep_latest:])
+    ranked = sorted((s for s in snaps if s not in keep and s.name in scores), key=lambda s: -scores[s.name])
+    keep.update(ranked[:keep_best])
+    gone = []
+    for s in snaps:
+        if s not in keep:
+            s.unlink(missing_ok=True)
+            gone.append(s.name)
+    return gone
+
+
 class DeckBook:
     def __init__(self, cat, rng: np.random.Generator, top: int = 3000):
         idx = read_json(SHARDS.parent / "index.json", {}) or {}
