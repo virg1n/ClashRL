@@ -442,7 +442,10 @@ def suite_decks(suite: str, n_pairs: int, seed: int) -> list[tuple[str, str]]:
         for i in range(n_pairs):
             for _ in range(200):  # popularity-weighted human deck FirstLight can also name
                 d = book.popular()
-                if all(cat.ids[n] in known for n, _ in parse_deck_key(d)):
+                dk = parse_deck_key(d)
+                # FirstLight's public tracker raises "public ability source changed card identity"
+                # when one side plays two hero cards (e.g. Hero Musketeer + Hero Ice Golem)
+                if all(cat.ids[n] in known for n, _ in dk) and sum(f == 2 for _, f in dk) <= 1:
                     break
             out.append((d, focus_at(i) if suite == "pop_vs_focus" else hog))
         return out
