@@ -205,8 +205,16 @@ def play_game(task: dict) -> dict:
         dk = [dk[i] for i in r.permutation(8)]
         decks.append([cat.ids[n] for n, _ in dk])
         forms.append([f for _, f in dk])
+    # command delay per team, ticks (FirstLight's own benchmark: none). A delayed play is
+    # accepted now and runs later; FirstLight's scene and our views see it when it runs.
+    dly = [0, 0]
+    for t in (0, 1):
+        dly[t] = int(task.get("fl_delay" if task["sides"][t]["kind"] == "fl" else "delay", 0))
     if hasattr(eng, "set_command_delay_ticks"):
-        eng.set_command_delay_ticks(0)
+        eng.set_command_delay_ticks(tuple(dly) if any(dly) else 0)
+    elif any(dly):
+        raise RuntimeError("this engine has no command delay")
+    pending: dict[tuple[int, int], tuple[int, int, int]] = {}  # (team, card) -> (form code, x, y)
     setup = MatchSetup(decks=decks, forms=forms, shuffle=ShuffleMode.NONE)
     eng.reset(seed, setup)
     rec_trace = None
@@ -225,7 +233,7 @@ def play_game(task: dict) -> dict:
         sd = task["sides"][t]
         if sd["kind"] == "ours" or sd.get("record"):
             views[t] = SeatView(cat, parser)
-            views[t].reset(t, decks[t], forms[t], decks[1 - t])
+            views[t].reset(t, decks[t], forms[t], decks[1 - t], delay_ticks=dly[t])
         if sd["kind"] == "ours":
             seats.append(OurSeat(t, _ours(sd["path"]), views[t], sd.get("decode", "t05")))
         else:
@@ -251,9 +259,35 @@ def play_game(task: dict) -> dict:
             rec_trace.record_frame(eng)
             rec_trace.record_step(tick, 1, commands, results)
         played = []
+
+        def ran(team, card, code, x, y, run_tick):
+            played.append((run_tick, team, card, code, x, y))
+            for v in views:
+                if v is not None:
+                    v.note_play(team, card)
+            if isinstance(seats[team], OurSeat):
+                st = seats[team].stats
+                st["plays"] += 1
+                if st["first_play_tick"] is None:
+                    st["first_play_tick"] = run_tick
+
+        for run_tick, team, kind, what, reason in ((eng.step_commands_run() or []) if any(dly) else []):
+            if reason != 0:
+                pending.pop((team, what), None)
+            elif kind == "deploy" and (team, what) in pending:
+                ran(team, what, *pending.pop((team, what)), run_tick)
+            elif kind == "ability":
+                played.append((run_tick, team, -1 - (what - HAND_SIZE), 0, 0, 0))
         for cmd, res in zip(commands, results):
             if res.status != DeployStatus.OK:
                 rejected[cmd.team] += 1
+                continue
+            if dly[cmd.team]:  # accepted; it runs (and is seen) dly ticks later
+                if cmd.hand_slot < HAND_SIZE:
+                    card = hands[cmd.team][cmd.hand_slot]
+                    form = scene.form_of(cmd.team, card)
+                    pending[(cmd.team, card)] = (2 if form == 2 else (1 if card in evo_ready[cmd.team] else 0),
+                                                 res.x, res.y)
                 continue
             if cmd.hand_slot >= HAND_SIZE:
                 played.append((res.tick, cmd.team, -1 - (cmd.hand_slot - HAND_SIZE), 0, 0, 0))
@@ -262,15 +296,7 @@ def play_game(task: dict) -> dict:
                 card = hands[cmd.team][cmd.hand_slot]
                 form = scene.form_of(cmd.team, card)
                 code = 2 if form == 2 else (1 if card in evo_ready[cmd.team] else 0)
-                played.append((res.tick, cmd.team, card, code, res.x, res.y))
-                for v in views:
-                    if v is not None:
-                        v.note_play(cmd.team, card)
-                if isinstance(seats[cmd.team], OurSeat):
-                    st = seats[cmd.team].stats
-                    st["plays"] += 1
-                    if st["first_play_tick"] is None:
-                        st["first_play_tick"] = tick
+                ran(cmd.team, card, code, res.x, res.y, res.tick)
             rec = recs.get(cmd.team)
             if rec is not None and rec["win"] is not None:
                 rec["win"]["cmds"].append((tick, int(cmd.hand_slot), card, int(cmd.x), int(cmd.y)))
