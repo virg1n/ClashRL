@@ -72,22 +72,27 @@ def _init(counter, gpus: list[int]):
     with counter.get_lock():
         i = counter.value
         counter.value += 1
-    if gpus and torch.cuda.is_available():
-        _W["device"] = f"cuda:{gpus[i % len(gpus)]}"
-    else:
-        _W["device"] = "cpu"
-    from flport.catalog import Catalog as FLCatalog
-    from native_runner.training.v4.factory import production_semantic_bundle
-
     from .game import Catalog, make_engine, make_parser
 
     eng = make_engine()
     _W["engine"] = eng
     _W["parser"] = make_parser(eng)
     _W["cat"] = Catalog.build(eng)
-    _W["flcat"] = FLCatalog.build(eng)
-    _W["bundle"] = production_semantic_bundle()
     _W["ours"] = {}
+    fl_setup(eng, f"cuda:{gpus[i % len(gpus)]}" if gpus and torch.cuda.is_available() else "cpu")
+
+
+def fl_setup(engine, device: str) -> None:
+    """FirstLight's catalogue and semantic bundle for this process (once), and the device its
+    models run on. ``FLSeat`` reads both from here."""
+    _paths()
+    _W["device"] = device
+    if "bundle" not in _W:
+        from flport.catalog import Catalog as FLCatalog
+        from native_runner.training.v4.factory import production_semantic_bundle
+
+        _W["flcat"] = FLCatalog.build(engine)
+        _W["bundle"] = production_semantic_bundle()
 
 
 def _ours(path: str):
@@ -442,7 +447,7 @@ def _fl_known_cards() -> frozenset:
 
 def suite_decks(suite: str, n_pairs: int, seed: int) -> list[tuple[str, str]]:
     """(candidate deck, opponent deck) per seat-swapped pair."""
-    from .game import HOG26, Catalog, deck_key, make_engine, parse_deck_key
+    from .game import HOG26, Catalog, deck_key, make_engine
     from .league import DeckBook, focus_decks
 
     hog = deck_key(HOG26)
@@ -465,15 +470,8 @@ def suite_decks(suite: str, n_pairs: int, seed: int) -> list[tuple[str, str]]:
         known = _fl_known_cards()
         book = DeckBook(cat, rng)
         out = []
-        for i in range(n_pairs):
-            for _ in range(200):  # popularity-weighted human deck FirstLight can also name
-                d = book.popular()
-                dk = parse_deck_key(d)
-                # FirstLight's public tracker raises "public ability source changed card identity"
-                # when one side plays two hero cards (e.g. Hero Musketeer + Hero Ice Golem)
-                if all(cat.ids[n] in known for n, _ in dk) and sum(f == 2 for _, f in dk) <= 1:
-                    break
-            out.append((d, focus_at(i) if suite == "pop_vs_focus" else hog))
+        for i in range(n_pairs):  # a popularity-weighted human deck FirstLight can also name
+            out.append((book.popular_known(known), focus_at(i) if suite == "pop_vs_focus" else hog))
         return out
     raise ValueError(f"unknown suite {suite}")
 

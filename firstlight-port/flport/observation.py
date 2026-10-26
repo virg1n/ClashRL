@@ -168,6 +168,10 @@ class Scene:
         self.unknown_cards: set[int] = set()
         self.tower_uid: dict[tuple[int, int], int] = {}
         self._mask_cache: dict = {}
+        # projectiles and spells have no engine id: each (team, card) gets its own block of
+        # synthetic ids, so an id never names two cards (FirstLight's public tracker binds
+        # (owner, entity id) to a hero card and raises if that card changes)
+        self.synth_block: dict[tuple[int, object], int] = {}
 
     # ------------------------------------------------------------------ helpers
     def fl_card(self, rs_card: int) -> int | None:
@@ -393,6 +397,14 @@ class Scene:
                 )
         return tuple(result)
 
+    def _synth_id(self, used: dict, team: int, card) -> int:
+        """Unique within the tick; the same id always belongs to the same (team, card)."""
+        key = (int(team), card)
+        block = self.synth_block.setdefault(key, len(self.synth_block))
+        k = used.get(key, 0)
+        used[key] = k + 1
+        return 5_000_000 + block * 1000 + k
+
     def _entities(self, state: BattleState) -> tuple[EntityStateV1, ...]:
         tick = int(state.tick)
         items: list[EntityStateV1] = []
@@ -482,9 +494,8 @@ class Scene:
                     effect_states=tuple(effects),
                 )
             )
-        next_id = 5_000_000
+        used: dict = {}
         for p in state.projectiles:
-            next_id += 1
             if p.firer_card_id >= 0:
                 name = self.catalog.unit_projectile_by_card.get(int(p.firer_card_id))
                 fl = self.fl_card(p.firer_card_id)
@@ -493,6 +504,7 @@ class Scene:
                 near_king = abs(p.y - king_y) < self.arena.subtile * 2.5
                 name = "KingProjectile" if near_king else "TowerPrincessProjectile"
                 fl = None
+            next_id = self._synth_id(used, p.team, fl if fl is not None else name)
             gid = self.catalog.projectile_gid.get(name or "")
             if gid is None:
                 self._note_unknown(f"projectile:{name}")
@@ -516,8 +528,8 @@ class Scene:
                 )
             )
         for s in state.spells:
-            next_id += 1
             fl = self.fl_card(s.card_id)
+            next_id = self._synth_id(used, s.team, fl if fl is not None else f"spell:{int(s.card_id)}")
             motion = int(s.motion)
             if motion in SPELL_FLIGHT_MOTIONS or motion == ROLLING:
                 table = self.catalog.spell_roll_by_card if motion == ROLLING else self.catalog.spell_flight_by_card

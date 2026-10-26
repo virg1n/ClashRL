@@ -53,6 +53,35 @@ deadline, a hang) signals each stage's own process first, so PPO writes a checkp
 its process group is killed; a supervisor that crashed is restarted by `run_ab.sh`'s loop and
 first kills any stage processes it left behind.
 
+## A, phase 2 (from the best A; B paused)
+
+Phase 1's A stopped improving: it trained toward the 1 s live delay while every evaluation ran
+at delay 0, and its self-play pool drifted (A vs FL Hog 2 fell from ~57% to 33%). Phase 2
+(`a_phase: 2`, the default) restarts A's PPO from `checkpoints/A/best_vs_general.pt` (the 8M
+snapshot, 0.73 vs FL General over 200 argmax games):
+
+- The first supervisor start archives phase 1's A run (`runs/ppo_A`, `league/A`, `runs/A`,
+  `runs/eval/A*`) to `archive/a_phase1_<time>/`, copies the best to
+  `checkpoints/A/phase2_init.pt` (PPO start and KL reference; later promotions never touch
+  it) and starts a new clock: the pipeline stops `a_phase_hours` (72) after that start.
+- Delay 0 in training (`ppo_fixed_delay_A`), as in the evaluation.
+- Opponents (`a_mix`): 20% the real FL General on its focus decks, 10% the real FL Hog 2 on
+  Hog 2.6, 50% self-play and past snapshots, 20% A's stage-2 BC model and the hardest past
+  snapshot. The stand-ins are no longer used. A's decks are as before (popular human decks;
+  against FirstLight, popular decks whose cards FirstLight can name).
+- The real FirstLight games run in their own env workers (`ppo_fl_workers`, one core and one
+  battle each, FirstLight on GPUs 2-3). The actor serves them whenever they are ready, so they
+  never hold the simulator workers back. Their share of training decisions is therefore set
+  by how many cores they get: `STATUS.md` and `actor_metrics.jsonl` (`decision_share`) show
+  the real split. Raise or lower `ppo_fl_workers` to move the FL share toward 30%.
+- All 4 GPUs for A: actor GPU 0, learner GPU 1, FirstLight workers and the evaluator GPUs 2-3.
+  A gets the cores B had: 40 of 48 (22 FirstLight workers, 18 simulator workers with 12
+  battles each; 6 cores for the evaluator, 2 spare). Expect roughly 1.4M decisions/h.
+- B is paused (`run_B: false`): no B PPO, and the evaluator screens A only.
+- Evaluation: every game argmax (`fl_eval_decode`), 80 games on `mixed` and 40 on each other
+  suite; phase 1's best (0.73 over 200 games) is the bar to beat. The start checkpoint is
+  screened once (label `phase2_start`) for comparison.
+
 ## Where results land
 
 | Path (under `AB_WORK`) | What |
@@ -80,10 +109,10 @@ action, seat-swapped pairs with the same seed and decks, no command delay. Two s
 The goal is above FL Hog's ~85%. `runs/eval/fl_baseline.json` measures FL Hog 2 vs General
 in our simulator under the same protocol, so the bar is known in this simulator too.
 
-Screens use 40 games on the primary suite and 20 on the other (decoding: card/tile at T=0.5,
-gate sampled). A screen ≥ `promote_gate` (0.6) and within 3 points of the best gets 160 more
-games; if the pooled win rate beats the best, the same number of games is played with argmax
-cards/tiles, and the better decoder is kept with its own statistics: the snapshot is promoted
+Screens use 80 games on the primary suite and 40 on each other suite, all argmax
+(`fl_eval_decode`; phase 1 screened at T=0.5 but recorded the best's argmax score, so its gate
+compared two different measurements). A screen ≥ `promote_gate` (0.6) and within 3 points of
+the best gets 160 more games; if the pooled win rate beats the best, the snapshot is promoted
 (league hard pool + `best_vs_general.pt`). `goal_reached` is set when the 95% lower bound
 clears 0.85.
 Anti-passivity is logged on every screen (plays per game, first play, share of wins where

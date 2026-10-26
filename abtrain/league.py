@@ -1,6 +1,13 @@
 """Opponent league and deck sampling for A and B (shares from ab-training.md, Da 2026-10-15).
 
-A: 40% self-play, 40% PFSP over frozen opponents (A's and B's snapshots, the BC models),
+A, phase 2 (from the best A, Da 2026-10-26; shares in ``a_mix``): 20% the real FirstLight
+   General on its focus decks, 10% the real FirstLight Hog 2 on Hog 2.6 (both in FirstLight env
+   workers, ``flbattle``), 50% self-play and PFSP over past snapshots (A's, B's, promoted),
+   20% A's stage-2 BC model and the snapshot A loses to most on the decks A loses to most.
+   The FirstLight share is set by how many env workers run FirstLight (``ppo_fl_workers``);
+   the simulator workers split the rest in proportion. Against FirstLight, A's deck is a
+   popular deck whose cards FirstLight can name.
+A, phase 1: 40% self-play, 40% PFSP over frozen opponents (A's and B's snapshots, the BC models),
    20% hard (FirstLight stand-ins, and the snapshot A loses to most on the decks A loses to most).
    A's own deck: popularity-weighted real deck from the 220k matches. Opponent decks: 65% by
    popularity, 30% FirstLight's General benchmark decks, 5% the decks A currently loses to most.
@@ -91,11 +98,24 @@ class DeckBook:
         self.pop_keys, self.pop_w = keys, w / w.sum()
         self.focus = focus_decks(cat) or keys[:20]
         self.hog = deck_key(HOG26)
+        self.cat_ids = cat.ids
         self.rng = rng
         self.stats: dict[str, list[float]] = {}  # deck -> [ema win rate, games]
 
     def popular(self) -> str:
         return self.pop_keys[int(self.rng.choice(len(self.pop_keys), p=self.pop_w))]
+
+    def popular_known(self, known) -> str:
+        """A popularity-weighted deck whose cards are all in ``known`` (RoyaleSim card ids),
+        e.g. the cards FirstLight can name."""
+        from .game import parse_deck_key
+
+        d = self.popular()
+        for _ in range(200):
+            if all(self.cat_ids[n] in known for n, _ in parse_deck_key(d)):
+                return d
+            d = self.popular()
+        return self.hog
 
     def focus_deck(self) -> str:
         return self.focus[int(self.rng.integers(len(self.focus)))]
@@ -121,8 +141,10 @@ class DeckBook:
 
 
 class League:
-    def __init__(self, run: str, cat, seed: int):
+    def __init__(self, run: str, cat, seed: int, mix: dict | None = None):
         self.run = run
+        self.mix = mix  # A phase 2 shares (config ``a_mix``); None = phase 1
+        self.fl_known: frozenset | None = None
         self.rng = np.random.default_rng(seed)
         self.decks = DeckBook(cat, self.rng)
         self.opps: dict[str, dict] = {}  # id -> {path, kind, wr, games}: the active pool
@@ -196,9 +218,12 @@ class League:
         rated.sort()
         return rated[0][1]
 
-    def next_match(self) -> dict:
-        """-> {"opp": id or "self", "decks": [key seat-learner, key opponent], "learner_seat": 0/1}"""
+    def next_match(self, fl: bool = False) -> dict:
+        """-> {"opp": id or "self", "decks": [key seat-learner, key opponent], "learner_seat": 0/1}.
+        ``fl``: a match for a FirstLight env worker (opponent ``fl:general`` / ``fl:hog2``)."""
         self.refresh()
+        if self.run == "A" and self.mix is not None:
+            return self._next_a2(fl)
         r = self.rng.random()
         standins = [k for k in self.opps if k.startswith("standin:")]
         stand_gen = [k for k in standins if "general" in k]
@@ -235,6 +260,30 @@ class League:
         if stand_gen and pick < 0.8:
             return self._m(stand_gen[0], own, d.focus_deck())
         return self._m(self._hardest(pool), own, d.hard())
+
+    def _next_a2(self, fl: bool) -> dict:
+        mix, d = self.mix, self.decks
+        if fl:
+            if self.fl_known is None:
+                from .flmatch import _fl_known_cards
+
+                self.fl_known = _fl_known_cards()
+            own = d.popular_known(self.fl_known)
+            g, h = mix["fl_general"], mix["fl_hog2"]
+            if self.rng.random() < g / max(1e-9, g + h):
+                return self._m("fl:general", own, d.focus_deck())
+            return self._m("fl:hog2", own, d.hog)
+        past = [k for k in self.opps if self.opps[k]["kind"] in ("snap", "promoted")]
+        bc = [k for k in ("bc:A2",) if k in self.opps]
+        own = d.popular()
+        w = np.array([mix["self"], mix["past"] if past else 0.0, mix["bc"] if bc else 0.0,
+                      mix["hard"] if past else 0.0])
+        pick = int(self.rng.choice(4, p=w / w.sum()))
+        if pick == 3:
+            return self._m(self._hardest(past), own, d.hard())
+        opp = ("self", self._pfsp(past) if past else None, bc[0] if bc else None)[pick]
+        q = self.rng.random()
+        return self._m(opp, own, d.popular() if q < 0.65 else d.focus_deck() if q < 0.95 else d.hard())
 
     def _m(self, opp: str | None, own: str, opp_deck: str) -> dict:
         if opp is None:

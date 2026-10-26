@@ -16,6 +16,14 @@ each stage from its latest checkpoint.
         stand-ins -> check each against the real model -> into the league
   eval  after extraction: FL Hog 2 vs General baseline -> screen stage 1/2 and every PPO
         snapshot against FL General, promote the best (``abtrain.evaluator``)
+
+A, phase 2 (``a_phase`` 2, Da 2026-10-26): the first start archives phase 1's A run (its PPO
+state, league snapshots, league stats and evaluations) to ``WORK/archive``, copies
+``checkpoints/A/best_vs_general.pt`` to ``checkpoints/A/phase2_init.pt`` (PPO start and KL
+reference), carries the best's FirstLight result over as the promotion bar and starts a new
+clock (``a_phase_hours``). A's PPO then runs on every GPU (actor 0, learner 1, its FirstLight
+env workers on the rest) with the cores B and the stand-ins would have used; B is paused
+(``run_B``).
 """
 
 from __future__ import annotations
@@ -75,14 +83,17 @@ def detect_cores() -> list[int]:
 
 
 class Layout:
-    """GPU and core split. Shared stages use every GPU; after the split A and B each get half."""
+    """GPU and core split. Shared stages use every GPU; after the split A and B each get half,
+    or A gets everything while B is paused (``run_B`` false)."""
 
-    def __init__(self):
+    def __init__(self, run_b: bool = True):
         self.gpus = detect_gpus()
         cores = detect_cores()
         n = len(cores)
         g = self.gpus
-        if len(g) >= 4:
+        if not run_b:
+            self.a_gpus, self.b_gpus = list(g), []
+        elif len(g) >= 4:
             self.a_gpus, self.b_gpus = g[:2], g[2:4]
         elif len(g) >= 2:
             self.a_gpus, self.b_gpus = g[:1], g[1:2]
@@ -90,10 +101,11 @@ class Layout:
             self.a_gpus = self.b_gpus = g[:1]
         n_eval = max(1, min(6, n // 8))
         n_ctl = 2 if n >= 16 else 0
-        per_run = max(1, (n - n_eval - n_ctl) // 2)
+        per_run = max(1, (n - n_eval - n_ctl) // (2 if run_b else 1))
         self.a_cores = cores[:per_run]
-        self.b_cores = cores[per_run : 2 * per_run]
-        self.eval_cores = cores[2 * per_run : 2 * per_run + n_eval] or cores[-1:]
+        self.b_cores = cores[per_run : 2 * per_run] if run_b else []
+        used = per_run * (2 if run_b else 1)
+        self.eval_cores = cores[used : used + n_eval] or cores[-1:]
         self.n_cores = n
 
     def describe(self) -> str:
@@ -127,11 +139,48 @@ class Supervisor:
         self.state.setdefault("runs", 0)
         self.state["runs"] += 1
         self.state["last_start"] = time.time()
-        self.deadline = self.state["started_at"] + self.cfg["deadline_hours"] * 3600
-        self.layout = Layout()
+        if self.cfg["a_phase"] >= 2 and self.state.get("a_phase", 1) < 2:
+            self.enter_a_phase2()
+        if self.state.get("a_phase_started") is not None:
+            self.deadline = self.state["a_phase_started"] + self.cfg["a_phase_hours"] * 3600
+        else:
+            self.deadline = self.state["started_at"] + self.cfg["deadline_hours"] * 3600
+        self.layout = Layout(self.cfg["run_B"])
         self.errors: list[str] = []
         self.save_state()
         reap_stale()
+
+    def enter_a_phase2(self):
+        """Archive phase 1's A run and start A's phase 2 from the best A (once)."""
+        best = CKPT / "A" / "best_vs_general.pt"
+        if not best.exists():
+            log(f"A phase 2 needs {best}; staying in phase 1", NAME)
+            return
+        reap_stale()  # nothing of phase 1 may still be writing where it is about to be moved from
+        init = CKPT / "A" / "phase2_init.pt"
+        info = read_json(best.with_suffix(".json"), None) or torch_load(best).get("eval") or {}
+        if not init.exists():  # PPO start and KL reference: never overwritten by later promotions
+            shutil.copyfile(best, init.with_name(".phase2_init.tmp"))
+            os.replace(init.with_name(".phase2_init.tmp"), init)
+            atomic_write_json(init.with_suffix(".json"), {**info, "copied_from": str(best), "time": time.time()})
+        arch = WORK / "archive" / f"a_phase1_{time.strftime('%Y%m%d_%H%M%S')}"
+        arch.mkdir(parents=True, exist_ok=True)
+        for src, name in ((RUNS / "ppo_A", "ppo_A"), (RUNS / "A", "league_state_A"), (LEAGUE / "A", "league_A"),
+                          (RUNS / "eval" / "A.jsonl", "eval_A.jsonl"), (RUNS / "eval" / "A_state.json", "eval_A_state.json"),
+                          (RUNS / "eval" / "DONE", "eval_DONE")):
+            if src.exists():
+                shutil.move(str(src), str(arch / name))
+        shutil.rmtree(SHM / "ppo_A", ignore_errors=True)
+        if info.get("win_rate") is not None:  # the bar a phase-2 snapshot must beat (same protocol)
+            atomic_write_json(RUNS / "eval" / "A_state.json",
+                              {"best": {**info, "carried_from_phase1": True}, "history": [], "improving": True,
+                               "promotions": []})
+        for stage in ("ppo_A", "evaluator"):
+            self.state["stages"].pop(stage, None)
+        self.state.update(a_phase=2, a_phase_started=time.time(), a_init=str(init), a_phase1_archive=str(arch))
+        self.save_state()
+        log(f"A phase 2: phase 1's A run archived to {arch}; PPO starts from {init} "
+            f"({info.get('win_rate')} vs FirstLight General over {info.get('games')} games)", NAME)
 
     # ---------------------------------------------------------------- state
     def save_state(self):
@@ -330,15 +379,24 @@ class Supervisor:
             a_init = RUNS / "bc1" / "final.pt"
             log(f"A/B test: stage 2 not accepted ({_ab_text(ab)} vs stage 1, needs {cfg['abtest_min_winrate']}): "
                 "A's PPO starts from stage 1", NAME)
-        self.state["a_init"] = str(a_init)
-        self.save_state()
+        if self.state.get("a_phase", 1) >= 2:  # B's stage 2 still starts from A's
+            b_init, a_init = a_init, Path(self.state["a_init"])
+        else:
+            b_init = a_init
+            self.state["a_init"] = str(a_init)
+            self.save_state()
         ta = self.lane(lambda: self.ppo_lane("A", a_init, L.a_gpus, L.a_cores), "lane_A")
-        tb = self.lane(lambda: self.b_lane(a_init), "lane_B")
+        tb = self.lane(lambda: self.b_lane(b_init), "lane_B")
         ta.join()
         tb.join()
 
     def b_lane(self, a_init: Path):
         cfg, L = self.cfg, self.layout
+        if not cfg["run_B"]:
+            log("B is paused (run_B false): no B stages this time", NAME)
+            if not self.is_done("ppo_B"):
+                self.set_stage("ppo_B", status="paused")
+            return
         args = ["--mode", "awbc_B", "--out", str(RUNS / "awbc_B"), "--init", str(RUNS / "awbc_A" / "final.pt")]
         if not _vref_done():
             args.append("--plain")
@@ -371,9 +429,12 @@ class Supervisor:
         actor, learner = (0, 1) if len(gpus) >= 2 else (0, 0)
         cmd = [PY, "-m", "abtrain.ppo", "--run", run, "--actor-gpu", str(actor), "--learner-gpu", str(learner),
                "--cores", _csv(cores), "--init", str(init)]
+        phase2 = run == "A" and self.state.get("a_phase", 1) >= 2
+        if phase2 and self.cfg["ppo_fl_workers"] > 0:  # real FirstLight opponents on the GPUs left over
+            cmd += ["--fl-workers", str(self.cfg["ppo_fl_workers"]), "--fl-gpus", _csv(list(range(2, len(gpus))) or [0])]
         from .ppo import run_finished
 
-        if not self.wait_standins():
+        if not phase2 and not self.wait_standins():  # phase 2 plays the real FirstLight models instead
             if not self.halted():
                 log(f"PPO {run} not started: the FirstLight stand-ins never became ready before the deadline", NAME)
             return
@@ -745,12 +806,17 @@ def _last_jsonl(path: Path) -> dict | None:
 
 
 def write_status(sup: Supervisor | None = None) -> str:
+    from .common import deadline_ts
+
     st = read_json(STATE, {}) or {}
     cfg = settings()
     started = st.get("started_at", time.time())
-    deadline = started + cfg["deadline_hours"] * 3600
+    deadline = deadline_ts()
     lines = [f"# A/B training status ({time.strftime('%Y-%m-%d %H:%M:%S')})", "",
-             f"Started {time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}, deadline "
+             f"Started {time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}"
+             + (f", A phase 2 since {time.strftime('%Y-%m-%d %H:%M', time.localtime(st['a_phase_started']))}"
+                if st.get("a_phase_started") else "")
+             + (", B paused" if not cfg["run_B"] else "") + ", deadline "
              f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))} ({(deadline - time.time()) / 3600:.1f} h left), "
              f"supervisor start #{st.get('runs', 0)}" + (f", MAIN LANE STOPPED: {st['aborted']}" if st.get("aborted") else "")
              + (f", REQUIREMENT NOT MET: {st['unmet']}" if st.get("unmet") else "")
@@ -784,6 +850,9 @@ def write_status(sup: Supervisor | None = None) -> str:
                      f"KL to stage 2 {lm.get('kl_ref', 0):.4f} (coef {lm.get('kl_coef', 0):.4f}, budget "
                      f"{lm.get('kl_budget', 0):.3f}), explained var {lm.get('ev', 0):.2f}, entropy {lm.get('ent', 0):.3f}"
                      + (" — DONE" if (rd / "DONE").exists() else ""))
+        if am and am.get("decision_share"):
+            lines.append(f"  - training decisions by opponent {am['decision_share']}"
+                         + (f", FirstLight games aborted {am['fl_aborted']}" if am.get("fl_aborted") else ""))
         if am:
             lines.append(f"  - games: score by opponent {am.get('score_by_opponent')}, plays/game "
                          f"{am.get('plays_per_game', 0):.1f}, first play {am.get('first_play_s')}, wins vs passive "

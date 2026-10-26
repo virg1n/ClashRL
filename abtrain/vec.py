@@ -4,7 +4,13 @@ Protocol (one round trip per decision for every battle):
   parent -> worker: [(lab_seat0, lab_seat1, next_spec), ...] for the worker's battles
   worker -> parent: [(obs_pair | None, rewards, done, info), ...]
 A battle that ends is reset at once with ``next_spec``; its first observation comes back in the
-same reply (``info['reset'] = True``). Observations travel with packed tile masks.
+same reply (``info['reset'] = True``). Observations travel with packed tile masks; a seat
+nobody acts for (a FirstLight seat) has ``None``.
+
+``kind="fl"`` workers run ``flbattle.FLBattle`` (a real FirstLight model on the other seat, on
+the worker's own GPU). They are slower than the simulator workers, so the actor talks to them
+one at a time (``send_step`` / ``ready`` / ``recv_step``) instead of in lockstep. A FirstLight
+battle that raises is reported as ``info['aborted']`` and reset with ``next_spec``.
 """
 
 from __future__ import annotations
@@ -26,6 +32,8 @@ _F16 = ("ent_f", "glob", "cardf", "priv_f")
 def pack_obs(o):
     """Tile masks packed to bits; float inputs rounded to float16 exactly as rollouts store
     them, so acting and training see identical inputs."""
+    if o is None:
+        return None
     o.tiles = np.packbits(o.tiles, axis=-1)
     for k in _F16:
         setattr(o, k, getattr(o, k).astype(np.float16))
@@ -33,6 +41,8 @@ def pack_obs(o):
 
 
 def unpack_obs(o):
+    if o is None:
+        return None
     if o.tiles.dtype == np.uint8 and o.tiles.shape[-1] != NT:
         o.tiles = np.unpackbits(o.tiles, axis=-1, count=NT).astype(bool)
     for k in _F16:
@@ -40,7 +50,7 @@ def unpack_obs(o):
     return o
 
 
-def _worker(conn, n_envs: int, rcfg: dict, cores: list[int] | None):
+def _worker(conn, n_envs: int, rcfg: dict, cores: list[int] | None, kind: str = "sim", device: str = "cpu"):
     os.environ["OMP_NUM_THREADS"] = "1"
     try:
         if cores and hasattr(os, "sched_setaffinity"):
@@ -50,7 +60,15 @@ def _worker(conn, n_envs: int, rcfg: dict, cores: list[int] | None):
     from .env import Battle, RewardCfg
 
     try:
-        battles = [Battle(rcfg=RewardCfg(**rcfg)) for _ in range(n_envs)]
+        if kind == "fl":
+            import torch
+
+            from .flbattle import FLBattle
+
+            torch.set_num_threads(1)
+            battles = [FLBattle(rcfg=RewardCfg(**rcfg), device=device) for _ in range(n_envs)]
+        else:
+            battles = [Battle(rcfg=RewardCfg(**rcfg)) for _ in range(n_envs)]
         cat = battles[0].cat
         for b in battles[1:]:
             b.cat = cat
@@ -68,7 +86,17 @@ def _worker(conn, n_envs: int, rcfg: dict, cores: list[int] | None):
             elif msg == "step":
                 out = []
                 for i, (lab0, lab1, nxt) in enumerate(payload):
-                    obs, rew, done, info = battles[i].step([lab0, lab1])
+                    if kind == "fl":
+                        try:
+                            obs, rew, done, info = battles[i].step([lab0, lab1])
+                        except Exception:  # one broken FirstLight game never stops PPO
+                            from .common import log
+
+                            tb = traceback.format_exc()
+                            log(f"FirstLight battle aborted:\n{tb}", "ppo_fl_worker")
+                            obs, rew, done, info = None, [0.0, 0.0], True, {"aborted": tb[-500:]}
+                    else:
+                        obs, rew, done, info = battles[i].step([lab0, lab1])
                     if done:
                         info["meta"] = battles[i].spec.meta
                         obs = battles[i].reset(nxt)
@@ -86,14 +114,16 @@ def _worker(conn, n_envs: int, rcfg: dict, cores: list[int] | None):
 class VecBattles:
     """``n_workers`` x ``per_worker`` battles. Battle ``k`` lives on worker ``k // per_worker``."""
 
-    def __init__(self, n_workers: int, per_worker: int, rcfg: dict, cores: list[int] | None = None):
+    def __init__(self, n_workers: int, per_worker: int, rcfg: dict, cores: list[int] | None = None,
+                 kind: str = "sim", devices: list[str] | None = None):
         self.n_workers, self.per_worker = n_workers, per_worker
         self.n = n_workers * per_worker
         self.conns, self.procs = [], []
         for w in range(n_workers):
             parent, child = _CTX.Pipe()
             mine = [cores[w % len(cores)]] if cores else None
-            p = _CTX.Process(target=_worker, args=(child, per_worker, rcfg, mine), daemon=True)
+            dev = devices[w % len(devices)] if devices else "cpu"
+            p = _CTX.Process(target=_worker, args=(child, per_worker, rcfg, mine, kind, dev), daemon=True)
             p.start()
             self.conns.append(parent)
             self.procs.append(p)
@@ -126,6 +156,21 @@ class VecBattles:
             for obs, rew, done, info in self._recv(c):
                 out.append(([unpack_obs(o) for o in obs], rew, done, info))
         return out
+
+    # one worker at a time (FirstLight workers): battle ``w * per_worker + i`` is its i-th
+    def send_step(self, w: int, labs: list, next_specs: list) -> None:
+        """labs / next_specs: one per battle of worker ``w``."""
+        self.conns[w].send(("step", [(lab[0], lab[1], nxt) for lab, nxt in zip(labs, next_specs)]))
+
+    def ready(self, workers: list[int], timeout: float | None = 0.0) -> list[int]:
+        """Those of ``workers`` (each sent a step) whose reply is waiting."""
+        from multiprocessing.connection import wait
+
+        got = wait([self.conns[w] for w in workers], timeout)
+        return [w for w in workers if self.conns[w] in got]
+
+    def recv_step(self, w: int) -> list:
+        return [([unpack_obs(o) for o in obs], rew, done, info) for obs, rew, done, info in self._recv(self.conns[w])]
 
     def close(self):
         for c in self.conns:

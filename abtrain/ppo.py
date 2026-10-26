@@ -1,9 +1,13 @@
-"""PPO with a league for one run (A or B) on two GPUs: an actor and a learner process.
+"""PPO with a league for one run (A or B): an actor and a learner process.
 
-    python -m abtrain.ppo --run A --actor-gpu 0 --learner-gpu 1 --cores 0-21 --init RUNS/A2/final.pt
+    python -m abtrain.ppo --run A --actor-gpu 0 --learner-gpu 1 --cores 0-39 --init RUNS/A2/final.pt
+    python -m abtrain.ppo --run A ... --fl-workers 22 --fl-gpus 2,3     # A, phase 2
 
 Actor (GPU ``actor_gpu``): CPU env workers play battles; seats are batched by model (current
-policy, frozen opponents, stand-ins) for inference. Learner seats are cut into 40 s segments
+policy, frozen opponents, stand-ins) for inference. With ``--fl-workers`` (A, phase 2) the last
+that many cores each run one battle against a real FirstLight model (``flbattle``, FirstLight
+on ``--fl-gpus``); the actor serves those workers whenever they are ready, without holding the
+simulator workers back. Learner seats are cut into 40 s segments
 (160 decisions) with the LSTM state carried across them; GAE is computed per segment. The
 reference model (the stage-2 checkpoint) runs alongside so each step also stores the reference
 log-probability of the action taken, for the KL-to-reference term. Every ~64k learner decisions
@@ -53,8 +57,12 @@ def nominal(run: str, cfg: dict) -> int:
 
 
 def delay_for(run: str, decisions: int, cfg: dict, rng: np.random.Generator) -> int:
-    """Command delay (ticks): ramps 0 -> live over the first 20% of the nominal run, then is
-    randomised near the live 21 ticks. B's second half runs at live latency only."""
+    """Command delay (ticks): ``ppo_fixed_delay_<run>`` when set (A phase 2: 0, as in the
+    evaluation). Otherwise it ramps 0 -> live over the first 20% of the nominal run, then is
+    randomised near the live 21 ticks; B's second half runs at live latency only."""
+    fixed = cfg.get(f"ppo_fixed_delay_{run}")
+    if fixed is not None:
+        return int(fixed)
     nom = nominal(run, cfg)
     live = cfg["live_delay_ticks"]
     frac = decisions / max(1, nom)
@@ -123,7 +131,8 @@ def _gae(r, v, boot, done_last, gamma, lam):
     return adv, adv + np.asarray(v, np.float32)
 
 
-def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
+def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers: int = 0,
+               fl_gpus: list[int] | None = None):
     import torch
 
     from .env import BattleSpec, SeatSpec
@@ -143,15 +152,26 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
     (sd / "rollouts").mkdir(parents=True, exist_ok=True)
     cat = Catalog.build(make_engine())
     seed = int(time.time()) % 100000
-    league = League(run, cat, seed)
+    phase2 = run == "A" and cfg["a_phase"] >= 2
+    league = League(run, cat, seed, mix=cfg["a_mix"] if phase2 else None)
     rng = np.random.default_rng(seed + 17)
     rcfg = dict(gamma=cfg["ppo_gamma"], shaping=cfg["shaping_coef"], personal=cfg["overflow_personal"],
                 unilateral=cfg["overflow_unilateral"], grace=cfg["overflow_grace"], cap=cfg["overflow_cap"],
                 elixir_coef=cfg["b_elixir_coef"])
-    n_workers = min(cfg["ppo_workers"], max(1, len(cores)))
+    # FirstLight env workers: the last ``n_fl`` cores, one battle each
+    n_fl = min(fl_workers, max(0, len(cores) - 1)) if phase2 else 0
+    if n_fl and delay_for(run, 0, cfg, rng) != 0:
+        raise SystemExit("FirstLight opponents need ppo_fixed_delay_A = 0")
+    sim_cores = cores[: len(cores) - n_fl]
+    n_workers = min(cfg["ppo_workers"], max(1, len(sim_cores)))
     per = cfg["ppo_envs_per_worker"]
-    vec = VecBattles(n_workers, per, rcfg, cores)
-    nb = vec.n
+    vec = VecBattles(n_workers, per, rcfg, sim_cores)
+    flv = None
+    if n_fl:
+        devs = [f"cuda:{g}" for g in (fl_gpus or [gpu])] if torch.cuda.is_available() else ["cpu"]
+        flv = VecBattles(n_fl, 1, rcfg, cores[len(cores) - n_fl :], kind="fl", devices=devs)
+    ns = vec.n
+    nb = ns + n_fl
     policy = build_model().to(dev).eval()
     ref = build_model().to(dev).eval()
     ck = torch_load(init)
@@ -177,10 +197,10 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
         if stop.is_set():
             return
         time.sleep(2)
-    log(f"actor up: {nb} battles on {n_workers} workers, weights v{version}", name)
+    log(f"actor up: {ns} battles on {n_workers} workers, {n_fl} FirstLight battles, weights v{version}", name)
 
-    def make_spec():
-        m = league.next_match()
+    def make_spec(fl: bool = False):
+        m = league.next_match(fl=fl)
         ls = m["learner_seat"]
         decks = [None, None]
         decks[ls] = league.decks.dealt(m["decks"][0])
@@ -190,12 +210,18 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
         delay = delay_for(run, decisions, cfg, rng)
         meta = {"opp": m["opp"], "learner_seat": ls, "learners": sorted(learners), "opp_deck": m["decks"][1],
                 "own_deck": m["decks"][0], "delay": delay}
+        if m["opp"].startswith("fl:"):
+            meta["fl"] = m["opp"][3:]
         return BattleSpec(seats, delay=delay, seed=int(rng.integers(2**62)), feature_drop=0.1, meta=meta)
 
-    specs = [make_spec() for _ in range(nb)]
-    obs = vec.reset(specs)
+    specs = [make_spec(k >= ns) for k in range(nb)]
+    obs = vec.reset(specs[:ns]) + (flv.reset(specs[ns:]) if flv else [])
     metas = [s.meta for s in specs]
-    nxt = [make_spec() for _ in range(nb)]
+    nxt = [make_spec(k >= ns) for k in range(nb)]
+    fl_idle = list(range(n_fl))  # FirstLight workers whose battle waits for our actions
+    fl_busy: list[int] = []  # ... and those stepping it
+    n_aborted = 0
+    nolab = [-1] * 6
     core = policy.core_dim
     H = torch.zeros(nb, 2, core, device=dev)
     C = torch.zeros(nb, 2, core, device=dev)
@@ -255,14 +281,17 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
     while not stop.is_set():
         if steps % 20 == 0:
             load_weights()
-        # ---- group seats by model and act
+        # ---- group seats by model and act (the simulator battles and the FirstLight ones that are ready)
+        active = list(range(ns)) + [ns + w for w in fl_idle]
         groups: dict[str, list[tuple[int, int]]] = {}
-        for k in range(nb):
+        for k in active:
             m = metas[k]
             for s in (0, 1):
-                key = "cur" if (s in m["learners"]) else m["opp"]
-                groups.setdefault(key, []).append((k, s))
-        labs = [[None, None] for _ in range(nb)]
+                if s in m["learners"]:
+                    groups.setdefault("cur", []).append((k, s))
+                elif not m["opp"].startswith("fl:"):  # FirstLight acts inside its env worker
+                    groups.setdefault(m["opp"], []).append((k, s))
+        labs = [[nolab, nolab] for _ in range(nb)]
         learner_out = {}
         with torch.no_grad(), torch.autocast(**amp):
             active = set(groups)
@@ -322,11 +351,26 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
                 seg.logp.append(float(learner_out["lp"][i]))
                 seg.logp_ref.append(float(learner_out["lpr"][i]))
                 seg.value.append(float(learner_out["v"][i]))
-        # ---- step every battle
-        res = vec.step([(labs[k][0], labs[k][1]) for k in range(nb)], nxt)
+        # ---- step every simulator battle; collect the FirstLight battles that have finished their step
+        for w in fl_idle:
+            flv.send_step(w, [labs[ns + w]], [nxt[ns + w]])
+        fl_busy += fl_idle
+        res = list(enumerate(vec.step([(labs[k][0], labs[k][1]) for k in range(ns)], nxt[:ns])))
+        fl_idle = flv.ready(fl_busy, 0.0 if ns else None) if fl_busy else []
+        fl_busy = [w for w in fl_busy if w not in fl_idle]
+        res += [(ns + w, flv.recv_step(w)[0]) for w in fl_idle]
         steps += 1
-        for k, (o2, rew, done, info) in enumerate(res):
+        for k, (o2, rew, done, info) in res:
             m = metas[k]
+            if done and info.get("aborted"):  # a FirstLight game that raised: its data is dropped
+                for s in m["learners"]:
+                    segs.pop((k, s), None)
+                n_aborted += 1
+                H[k], C[k], HR[k], CR[k] = 0, 0, 0, 0
+                metas[k] = nxt[k].meta
+                nxt[k] = make_spec(k >= ns)
+                obs[k] = o2
+                continue
             for s in m["learners"]:
                 seg = segs.get((k, s))
                 if seg is not None and seg.rows and len(seg.reward) < len(seg.rows):
@@ -338,9 +382,10 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
                         close_seg((k, s), seg, 0.0, True)
                 ls = m["learner_seat"]
                 score = (info["result"][ls] + 1) / 2.0
-                if m["opp"] != "self":
+                if m["opp"] != "self" and not m["opp"].startswith("fl:"):
                     league.report(m["opp"], m["opp_deck"], score)
                 ep_stats.append({"opp": m["opp"], "score": score, "ticks": info["ticks"],
+                                 "decisions": info["steps"] * len(m["learners"]),
                                  "plays": info["plays"][ls], "opp_plays": info["plays"][1 - ls],
                                  "first_play": info["first_play"][ls], "overflow": info["overflow"][ls],
                                  "trade": info["elixir_trade"][ls], "delay": m.get("delay", 0)})
@@ -349,7 +394,7 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
                 HR[k] = 0
                 CR[k] = 0
                 metas[k] = nxt[k].meta
-                nxt[k] = make_spec()
+                nxt[k] = make_spec(k >= ns)
             else:
                 for s in m["learners"]:
                     seg = segs.get((k, s))
@@ -364,7 +409,8 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
             (rd / "actor_heartbeat").write_text(str(now))
         if now - t_metric > 300 and ep_stats:
             t_metric = now
-            append_jsonl(rd / "actor_metrics.jsonl", _episode_summary(ep_stats, version, decisions))
+            append_jsonl(rd / "actor_metrics.jsonl", dict(_episode_summary(ep_stats, version, decisions),
+                                                          fl_aborted=n_aborted))
             ep_stats = []
         if now - t_league > 120:
             t_league = now
@@ -372,21 +418,28 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop):
             atomic_write_json(rd / "league_summary.json", {"time": now, "decisions": decisions,
                                                           "opponents": league.summary()})
     vec.close()
+    if flv:
+        flv.close()
 
 
 def _episode_summary(eps: list[dict], version: int, decisions: int) -> dict:
     by: dict[str, list[float]] = {}
+    dec: dict[str, float] = {}
     for e in eps:
         kind = e["opp"].split(":")[0] if e["opp"] != "self" else "self"
-        if e["opp"].startswith("standin:"):
+        if e["opp"].startswith(("standin:", "fl:")) or e["opp"] == "bc:A2":
             kind = e["opp"]
         by.setdefault(kind, []).append(e["score"])
+        dec[kind] = dec.get(kind, 0.0) + e.get("decisions", 0)
+    total = max(1.0, sum(dec.values()))
     wins = [e for e in eps if e["score"] == 1.0]
     passive = sum(1 for e in wins if e["opp_plays"] <= 3)
     first = [e["first_play"] * 0.05 for e in eps if e["first_play"] >= 0]
     return {
         "time": time.time(), "version": version, "decisions": decisions, "episodes": len(eps),
         "score_by_opponent": {k: (round(float(np.mean(v)), 3), len(v)) for k, v in by.items()},
+        # share of the learner's training decisions from games that ended in this window
+        "decision_share": {k: round(v / total, 3) for k, v in sorted(dec.items())},
         "plays_per_game": float(np.mean([e["plays"] for e in eps])),
         "first_play_s": float(np.mean(first)) if first else None,
         "wins_vs_passive_share": passive / max(1, len(wins)),
@@ -754,10 +807,10 @@ def _guard(stop, parent: int) -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
-def _actor_entry(run, gpu, cores, init, stop, parent):
+def _actor_entry(run, gpu, cores, init, stop, parent, fl_workers=0, fl_gpus=None):
     _guard(stop, parent)
     try:
-        actor_main(run, gpu, cores, init, stop)
+        actor_main(run, gpu, cores, init, stop, fl_workers, fl_gpus)
     except Exception:
         log("actor crashed:\n" + traceback.format_exc(), f"ppo_{run}_actor")
         raise
@@ -779,6 +832,8 @@ def main(argv=None):
     ap.add_argument("--learner-gpu", type=int, default=1)
     ap.add_argument("--cores", default="0-21")
     ap.add_argument("--init", required=True, help="stage-2 checkpoint: PPO start and KL reference")
+    ap.add_argument("--fl-workers", type=int, default=0, help="env workers (cores) playing the real FirstLight")
+    ap.add_argument("--fl-gpus", default="", help="GPUs for those workers' FirstLight models, e.g. 2,3")
     a = ap.parse_args(argv)
     if run_finished(a.run):
         log(f"run {a.run} already finished")
@@ -787,7 +842,8 @@ def main(argv=None):
     stop = _CTX.Event()
     cores = _parse_cores(a.cores)
     learner = _CTX.Process(target=_learner_entry, args=(a.run, a.learner_gpu, a.init, stop, os.getpid()))
-    actor = _CTX.Process(target=_actor_entry, args=(a.run, a.actor_gpu, cores, a.init, stop, os.getpid()))
+    actor = _CTX.Process(target=_actor_entry, args=(a.run, a.actor_gpu, cores, a.init, stop, os.getpid(),
+                                                    a.fl_workers, _parse_cores(a.fl_gpus)))
     learner.start()
     actor.start()
 

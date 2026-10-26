@@ -43,6 +43,14 @@ HF_REVISION = "059d43a02138a34b1b3009cc2acc7630fb99a638"
 DEFAULTS: dict[str, Any] = {
     # wall clock: the whole pipeline stops cleanly this many hours after the first start
     "deadline_hours": 128.0,  # 66 h planned + 2 days added after the 24 Oct stop (60 GiB home quota)
+    # A, phase 2 (Da 2026-10-26): PPO again from checkpoints/A/best_vs_general.pt (the 8M snapshot,
+    # 0.73 vs FirstLight General) at delay 0, against the real FirstLight models, on all GPUs; B
+    # paused. The first supervisor start with a_phase 2 archives phase 1's A run (WORK/archive) and
+    # starts a new clock: the pipeline then stops a_phase_hours after that start.
+    "a_phase": 2,
+    "a_phase_hours": 72.0,
+    "run_B": False,  # B's PPO (paused in A's phase 2)
+    "a_mix": {"fl_general": 0.2, "fl_hog2": 0.1, "self": 0.25, "past": 0.25, "bc": 0.1, "hard": 0.1},
     # stage 0 extraction
     "extract_workers": 46,
     "extract_limit_tasks": 0,  # tests only: 0 = every task
@@ -89,7 +97,8 @@ DEFAULTS: dict[str, Any] = {
     "standin_wait_hours": 3.0,  # with require_standins false: how long PPO waits for them first
     "standin_lr": 5e-5,
     # PPO (stage 3-4)
-    "ppo_workers": 19,  # CPU env worker processes per run
+    "ppo_workers": 40,  # at most this many simulator env worker processes (one core each) per run
+    "ppo_fl_workers": 22,  # A phase 2: env workers (one core, one battle each) playing the real FirstLight
     "ppo_envs_per_worker": 12,
     "ppo_segment": 160,  # 40 s of 250 ms decisions, LSTM state carried across segments
     "ppo_chunk": 64,
@@ -120,6 +129,8 @@ DEFAULTS: dict[str, Any] = {
     "keep_best_snapshots": 2,  # ... plus the best by FirstLight screen (home quota is 60 GiB)
     "delay_ramp_frac": 0.2,
     "live_delay_ticks": 21,
+    "ppo_fixed_delay_A": 0,  # ticks; None = phase 1's ramp to the live delay
+    "ppo_fixed_delay_B": None,
     "b_bc_aux_coef": 0.2,
     "b_bc_aux_frac": 0.25,
     "b_elixir_coef": 0.01,
@@ -131,7 +142,8 @@ DEFAULTS: dict[str, Any] = {
     "overflow_cap": 0.1,
     # evaluation against the real FirstLight General through flport
     "fl_eval_workers": 6,
-    "fl_eval_games": 40,  # screen: primary suite; the other suite gets half
+    "fl_eval_games": 80,  # screen: primary suite; the other suites get half each
+    "fl_eval_decode": "argmax",  # one decoding for screens, promotion games and the best's score
     "fl_promo_games": 160,  # extra primary-suite games before a promotion
     "promote_gate": 0.6,  # minimum screen win rate vs General to try a promotion
     "standin_check_games": 20,
@@ -248,12 +260,16 @@ def seed_all(seed: int) -> None:
 
 
 def deadline_ts() -> float:
-    """Unix time at which everything should wrap up, fixed at the first start."""
+    """Unix time at which everything should wrap up: fixed at the first start, or at the start
+    of A's phase 2 (``a_phase_hours`` after it)."""
     st = read_json(STATE, {}) or {}
+    cfg = settings()
+    if st.get("a_phase_started") is not None:
+        return float(st["a_phase_started"]) + cfg["a_phase_hours"] * 3600
     started = st.get("started_at")
     if started is None:
-        return time.time() + settings()["deadline_hours"] * 3600
-    return float(started) + settings()["deadline_hours"] * 3600
+        return time.time() + cfg["deadline_hours"] * 3600
+    return float(started) + cfg["deadline_hours"] * 3600
 
 
 def hours_left() -> float:

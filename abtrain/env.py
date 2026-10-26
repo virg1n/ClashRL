@@ -59,6 +59,7 @@ class Battle:
         self.views = [SeatView(self.cat, self.parser), SeatView(self.cat, self.parser)]
         self.rng = np.random.default_rng(0)
         self.spec: BattleSpec | None = None
+        self.observed = (0, 1)  # seats that get an observation (a FirstLight seat needs none)
 
     def reset(self, spec: BattleSpec) -> list[Obs]:
         from royalegym.protocol import MatchSetup, ShuffleMode
@@ -85,6 +86,9 @@ class Battle:
     def _observe(self) -> list[Obs]:
         out = []
         for s in (0, 1):
+            if s not in self.observed:
+                out.append(None)
+                continue
             cand, tiles = legal_masks(self.parser, self.state, s)
             o = self.views[s].build(self.state, cand, tiles)
             if self.spec.feature_drop > 0 and len(o.ent_ids):
@@ -99,13 +103,11 @@ class Battle:
 
     def step(self, labs) -> tuple[list[Obs] | None, list[float], bool, dict]:
         """labs: per seat (c1, t1, d1, c2, t2, d2), -1 = none. Returns (obs, rewards, done, info)."""
-        from royalegym.protocol import DeployStatus
-
         assert not self.done
         st0 = self.state
         tick0 = int(st0.tick)
         sends: list[tuple[int, int, object]] = []
-        for s in (0, 1):
+        for s in self.observed:
             lab = [int(x) for x in labs[s]]
             for j in (0, 1):
                 c, t, d = lab[3 * j : 3 * j + 3]
@@ -115,6 +117,13 @@ class Battle:
                     continue
                 sends.append((tick0 + max(0, min(d, DT - 1)), s, command(s, c, t)))
         sends.sort(key=lambda x: (x[0], x[1]))
+        self._window(tick0, sends)
+        return self._rewards(st0, tick0)
+
+    def _window(self, tick0: int, sends: list) -> None:
+        """Run the DT ticks of one decision window, sending each play at its tick."""
+        from royalegym.protocol import DeployStatus
+
         delayed = self.engine.command_delay_ticks != (0, 0) if hasattr(self.engine, "command_delay_ticks") else False
         for k in range(DT):
             now = tick0 + k
@@ -135,6 +144,8 @@ class Battle:
                 self.state = self.engine.state()
             if self.state.game_over:
                 break
+
+    def _rewards(self, st0, tick0: int) -> tuple[list[Obs] | None, list[float], bool, dict]:
         st = self.state
         self.stats["steps"] += 1
         g = self.rcfg.gamma

@@ -12,13 +12,17 @@ half as many each.
      a popular human deck vs FL General on a focus deck), pop_vs_hog2 (A on a popular human
      deck vs FL Hog 2 on Hog 2.6)
   B (Hog specialist): hog_vs_focus (B on Hog 2.6 vs FL General on a focus deck; primary)
-The stage-1/2 checkpoints are screened first, as the starting point.
+The stage-1/2 checkpoints are screened first, as the starting point (in A's phase 2: only the
+phase's start, ``checkpoints/A/phase2_init.pt``). B is skipped while it is paused (``run_B``).
+
+Every game uses one decoding, ``fl_eval_decode`` (argmax), so the screen, the promotion games
+and the best's score are the same measurement (phase 1 screened with t05 but stored the best's
+argmax score, so the gate compared two different things).
 
 Promotion: a screen at or above the gate (``promote_gate``) and within 3 points of the best
 so far earns ``fl_promo_games`` more games on the primary suite; if the pooled win rate beats
 the best, the snapshot is promoted: copied to ``LEAGUE/promoted`` (a hard opponent for both
-runs) and to ``checkpoints/<run>/best_vs_general.pt`` with its numbers. The better of the
-``t05`` and ``argmax`` decodings is measured on promotion and recorded (Stage 5).
+runs) and to ``checkpoints/<run>/best_vs_general.pt`` with its numbers.
 
 Outputs: ``RUNS/eval/<run>.jsonl`` (every screen), ``RUNS/eval/<run>_state.json`` (best,
 history, the ``improving`` flag the learner uses to relax its KL budget, goal flags).
@@ -55,6 +59,8 @@ def _seed(path: str) -> int:
 class Evaluator:
     def __init__(self):
         self.cfg = settings()
+        self.runs = ("A", "B") if self.cfg["run_B"] else ("A",)
+        self.decode = self.cfg["fl_eval_decode"]
         EV.mkdir(parents=True, exist_ok=True)
         self.done = read_json(EV / "evaluated.json", {}) or {}
         # checkpoints whose screen could not complete get another try after a restart
@@ -91,11 +97,11 @@ class Evaluator:
         log(f"now screening {run} {label} ({games} games: {', '.join(SUITES[run])})", NAME)
         atomic_write_json(EV / "current.json", {"run": run, "label": label, "suites": list(SUITES[run]),
                                                 "games": games, "started": t0})
-        res = {"run": run, "label": label, "path": str(path), "time": time.time(), "decode": "t05",
+        res = {"run": run, "label": label, "path": str(path), "time": time.time(), "decode": self.decode,
                "suites": list(SUITES[run]), "version": VERSIONS[run]}
         for k, suite in enumerate(SUITES[run]):
             games = cfg["fl_eval_games"] if k == 0 else max(2, cfg["fl_eval_games"] // 2)
-            res[suite] = self.play(str(path), suite, games, "t05", seed + k)
+            res[suite] = self.play(str(path), suite, games, self.decode, seed + k)
         try:
             res["decisions"] = int(torch_load(path).get("decisions", 0))
         except Exception:
@@ -119,25 +125,16 @@ class Evaluator:
         log(f"now playing {cfg['fl_promo_games']} promotion games for {run} {path.stem} ({wr:.3f} on {prim})", NAME)
         atomic_write_json(EV / "current.json", {"run": run, "label": f"{path.stem} promotion check", "suites": [prim],
                                                 "games": cfg["fl_promo_games"], "started": time.time()})
-        more = self.play(str(path), prim, cfg["fl_promo_games"], "t05", seed)
+        more = self.play(str(path), prim, cfg["fl_promo_games"], self.decode, seed)
         wins = res[prim]["wins"] + more["wins"]
         n = res[prim]["games"] + more["games"]
         pooled = wins / max(1, n)
         lo, hi = wilson(wins, n)
         log(f"promotion check {run} {path.name}: pooled {pooled:.3f} over {n} games (best so far {best:.3f})", NAME)
-        res["promotion"] = {"games": n, "wins": wins, "win_rate": pooled, "wilson95": [lo, hi]}
+        res["promotion"] = {"games": n, "wins": wins, "win_rate": pooled, "wilson95": [lo, hi], "decode": self.decode}
         if pooled <= best:
             return
-        # Stage 5 decoding: argmax (cards/tiles) gets the same number of games as t05 had; the
-        # decoder kept is the one with the higher win rate, with its own statistics
-        alt = self.play(str(path), prim, n, "argmax", seed + 1)
-        decode = "t05"
-        if alt["win_rate"] > pooled:
-            decode, wins, n = "argmax", alt["wins"], alt["games"]
-            pooled = wins / max(1, n)
-            lo, hi = wilson(wins, n)
-            if pooled <= best:
-                return
+        decode = self.decode
         ck = torch_load(path)
         sd = ck["model"] if "model" in ck else ck
         tag = f"{run}_{path.stem[5:]}"
@@ -146,7 +143,7 @@ class Evaluator:
         torch_save_atomic({"model": {k: v.half() for k, v in sd.items()}, "run": run}, LEAGUE / "promoted" / f"{tag}.pt")
         info = {"run": run, "source": str(path), "decisions": res.get("decisions"), "suite": prim,
                 "opponent": "FirstLight General (argmax)", "win_rate": pooled, "games": n, "wilson95": [lo, hi],
-                "decode": decode, "argmax_check": alt, "other_suites": {s: res[s] for s in SUITES[run][1:]},
+                "decode": decode, "other_suites": {s: res[s] for s in SUITES[run][1:]},
                 "time": time.time(),
                 "target": cfg["target_winrate"], "goal_reached": lo > cfg["target_winrate"]}
         dst = CKPT / run / "best_vs_general.pt"
@@ -163,7 +160,9 @@ class Evaluator:
         append_jsonl(EV / f"{run}.jsonl", res)
         if ref:
             st.setdefault("references", {})[res["label"]] = {s: res[s]["win_rate"] for s in SUITES[run]}
-            if st["best"] is None or res[prim]["win_rate"] > st["best"]["win_rate"]:
+            # phase 2 carries phase 1's best (200 games) over as the bar; a reference never replaces it
+            if st["best"] is None or (res[prim]["win_rate"] > st["best"]["win_rate"]
+                                      and not st["best"].get("carried_from_phase1")):
                 # the human-only start is the bar PPO snapshots must beat; it is not re-promoted
                 st["best"] = {"source": res["path"], "win_rate": res[prim]["win_rate"], "games": res[prim]["games"],
                               "suite": prim, "reference": True}
@@ -195,11 +194,14 @@ class Evaluator:
         return any_version and any(k == base or k.startswith(base + "@v") for k in self.done)
 
     def next_reference(self) -> tuple[str, Path, str] | None:
-        """The stage-1/2 checkpoints, screened once as the starting point."""
-        for run, label, path, rescreen in (("A", "stage1", RUNS / "bc1" / "final.pt", False),
-                                           ("A", "stage2", RUNS / "awbc_A" / "final.pt", True),
-                                           ("B", "stage2", RUNS / "awbc_B" / "final.pt", True)):
-            if path.exists() and not self._seen(path, run, any_version=not rescreen):
+        """The stage-1/2 checkpoints (in A's phase 2: its start), screened once as the starting point."""
+        if self.cfg["a_phase"] >= 2:
+            refs = [("A", "phase2_start", CKPT / "A" / "phase2_init.pt", False)]
+        else:
+            refs = [("A", "stage1", RUNS / "bc1" / "final.pt", False), ("A", "stage2", RUNS / "awbc_A" / "final.pt", True)]
+        refs.append(("B", "stage2", RUNS / "awbc_B" / "final.pt", True))
+        for run, label, path, rescreen in refs:
+            if run in self.runs and path.exists() and not self._seen(path, run, any_version=not rescreen):
                 return run, path, label
         return None
 
@@ -225,18 +227,19 @@ class Evaluator:
             f"{res['win_rate']:.3f} ({res['games']} games)", NAME)
 
     def next_snapshot(self) -> tuple[str, Path] | None:
-        for k in range(2):
-            run = ("A", "B")[(self.turn + k) % 2]
+        n = len(self.runs)
+        for k in range(n):
+            run = self.runs[(self.turn + k) % n]
             snaps = _snapshots(run)
             if snaps and not self._seen(snaps[-1], run):
-                self.turn = (self.turn + k + 1) % 2
+                self.turn = (self.turn + k + 1) % n
                 return run, snaps[-1]
         return None
 
     def finished(self) -> bool:
         from .ppo import run_finished
 
-        for run in ("A", "B"):
+        for run in self.runs:
             if not run_finished(run):
                 return False
             snaps = _snapshots(run)
@@ -253,7 +256,7 @@ class Evaluator:
             ref = self.next_reference()
             if ref is not None:
                 run, path, label = ref
-            elif not self.baseline_done:
+            elif not self.baseline_done and "B" in self.runs:
                 self.baseline_extra()
                 self.baseline_done = True
                 continue
