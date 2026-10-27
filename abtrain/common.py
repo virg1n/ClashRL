@@ -98,7 +98,10 @@ DEFAULTS: dict[str, Any] = {
     "standin_lr": 5e-5,
     # PPO (stage 3-4)
     "ppo_workers": 40,  # at most this many simulator env worker processes (one core each) per run
-    "ppo_fl_workers": 22,  # A phase 2: env workers (one core, one battle each) playing the real FirstLight
+    "ppo_fl_workers": 22,  # A phase 2: env workers (one core each) playing the real FirstLight
+    # FirstLight battles per such worker. Every battle moves one decision per actor round (~1 s),
+    # so 1 per worker gave FirstLight only ~3% of training; 6 x 22 ~ 30%
+    "ppo_fl_envs_per_worker": 6,
     "ppo_envs_per_worker": 12,
     "ppo_segment": 160,  # 40 s of 250 ms decisions, LSTM state carried across segments
     "ppo_chunk": 64,

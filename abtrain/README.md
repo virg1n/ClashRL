@@ -69,14 +69,15 @@ snapshot, 0.73 vs FL General over 200 argmax games):
   Hog 2.6, 50% self-play and past snapshots, 20% A's stage-2 BC model and the hardest past
   snapshot. The stand-ins are no longer used. A's decks are as before (popular human decks;
   against FirstLight, popular decks whose cards FirstLight can name).
-- The real FirstLight games run in their own env workers (`ppo_fl_workers`, one core and one
-  battle each, FirstLight on GPUs 2-3). The actor serves them whenever they are ready, so they
+- The real FirstLight games run in their own env workers (`ppo_fl_workers` cores, each with
+  `ppo_fl_envs_per_worker` battles, FirstLight on GPUs 2-3). The actor serves them whenever they are ready, so they
   never hold the simulator workers back. Their share of training decisions is therefore set
-  by how many cores they get: `STATUS.md` and `actor_metrics.jsonl` (`decision_share`) show
-  the real split. Raise or lower `ppo_fl_workers` to move the FL share toward 30%.
+  by how many FirstLight battles there are (each moves one decision per actor round):
+  `STATUS.md` and `actor_metrics.jsonl` (`decision_share`) show the real split. Raise or lower
+  `ppo_fl_envs_per_worker` to move the FL share toward 30%.
 - All 4 GPUs for A: actor GPU 0, learner GPU 1, FirstLight workers and the evaluator GPUs 2-3.
-  A gets the cores B had: 40 of 48 (22 FirstLight workers, 18 simulator workers with 12
-  battles each; 6 cores for the evaluator, 2 spare). Expect roughly 1.4M decisions/h.
+  A gets the cores B had: 40 of 48 (22 FirstLight workers with 6 battles each, 18 simulator
+  workers with 12 battles each; 6 cores for the evaluator, 2 spare). Expect roughly 1.4M decisions/h.
 - B is paused (`run_B: false`): no B PPO, and the evaluator screens A only.
 - Evaluation: every game argmax (`fl_eval_decode`), 80 games on `mixed` and 40 on each other
   suite; phase 1's best (0.73 over 200 games) is the bar to beat. The start checkpoint is

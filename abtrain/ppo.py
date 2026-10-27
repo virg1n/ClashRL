@@ -5,9 +5,10 @@
 
 Actor (GPU ``actor_gpu``): CPU env workers play battles; seats are batched by model (current
 policy, frozen opponents, stand-ins) for inference. With ``--fl-workers`` (A, phase 2) the last
-that many cores each run one battle against a real FirstLight model (``flbattle``, FirstLight
-on ``--fl-gpus``); the actor serves those workers whenever they are ready, without holding the
-simulator workers back. Learner seats are cut into 40 s segments
+that many cores each run ``ppo_fl_envs_per_worker`` battles against a real FirstLight model
+(``flbattle``, FirstLight on ``--fl-gpus``); the actor serves those workers whenever they are
+ready, without holding the simulator workers back. A battle advances one decision per actor
+round, so the FirstLight share of training grows with the number of FirstLight battles. Learner seats are cut into 40 s segments
 (160 decisions) with the LSTM state carried across them; GAE is computed per segment. The
 reference model (the stage-2 checkpoint) runs alongside so each step also stores the reference
 log-probability of the action taken, for the KL-to-reference term. Every ~64k learner decisions
@@ -158,8 +159,9 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
     rcfg = dict(gamma=cfg["ppo_gamma"], shaping=cfg["shaping_coef"], personal=cfg["overflow_personal"],
                 unilateral=cfg["overflow_unilateral"], grace=cfg["overflow_grace"], cap=cfg["overflow_cap"],
                 elixir_coef=cfg["b_elixir_coef"])
-    # FirstLight env workers: the last ``n_fl`` cores, one battle each
+    # FirstLight env workers: the last ``n_fl`` cores, ``pf`` battles each (stepped one after another)
     n_fl = min(fl_workers, max(0, len(cores) - 1)) if phase2 else 0
+    pf = max(1, int(cfg.get("ppo_fl_envs_per_worker", 1)))
     if n_fl and delay_for(run, 0, cfg, rng) != 0:
         raise SystemExit("FirstLight opponents need ppo_fixed_delay_A = 0")
     sim_cores = cores[: len(cores) - n_fl]
@@ -169,9 +171,12 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
     flv = None
     if n_fl:
         devs = [f"cuda:{g}" for g in (fl_gpus or [gpu])] if torch.cuda.is_available() else ["cpu"]
-        flv = VecBattles(n_fl, 1, rcfg, cores[len(cores) - n_fl :], kind="fl", devices=devs)
+        flv = VecBattles(n_fl, pf, rcfg, cores[len(cores) - n_fl :], kind="fl", devices=devs)
     ns = vec.n
-    nb = ns + n_fl
+    nb = ns + (flv.n if flv else 0)
+
+    def fl_battles(w: int) -> range:  # global indices of FirstLight worker w's battles
+        return range(ns + w * pf, ns + (w + 1) * pf)
     policy = build_model().to(dev).eval()
     ref = build_model().to(dev).eval()
     ck = torch_load(init)
@@ -197,7 +202,7 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
         if stop.is_set():
             return
         time.sleep(2)
-    log(f"actor up: {ns} battles on {n_workers} workers, {n_fl} FirstLight battles, weights v{version}", name)
+    log(f"actor up: {ns} battles on {n_workers} workers, {nb - ns} FirstLight battles on {n_fl} workers, weights v{version}", name)
 
     def make_spec(fl: bool = False):
         m = league.next_match(fl=fl)
@@ -218,9 +223,10 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
     obs = vec.reset(specs[:ns]) + (flv.reset(specs[ns:]) if flv else [])
     metas = [s.meta for s in specs]
     nxt = [make_spec(k >= ns) for k in range(nb)]
-    fl_idle = list(range(n_fl))  # FirstLight workers whose battle waits for our actions
-    fl_busy: list[int] = []  # ... and those stepping it
+    fl_idle = list(range(n_fl))  # FirstLight workers whose battles wait for our actions
+    fl_busy: list[int] = []  # ... and those stepping them
     n_aborted = 0
+    step_by: dict[str, int] = {}  # learner decisions collected by opponent kind since the last metrics line
     nolab = [-1] * 6
     core = policy.core_dim
     H = torch.zeros(nb, 2, core, device=dev)
@@ -282,7 +288,7 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
         if steps % 20 == 0:
             load_weights()
         # ---- group seats by model and act (the simulator battles and the FirstLight ones that are ready)
-        active = list(range(ns)) + [ns + w for w in fl_idle]
+        active = list(range(ns)) + [k for w in fl_idle for k in fl_battles(w)]
         groups: dict[str, list[tuple[int, int]]] = {}
         for k in active:
             m = metas[k]
@@ -347,18 +353,20 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
                     o = learner_out["old"]
                     seg.states.append((pos, o[0][i], o[1][i], o[2][i], o[3][i]))
                 seg.rows.append(obs[k][s])
+                kind = _opp_kind(metas[k]["opp"])
+                step_by[kind] = step_by.get(kind, 0) + 1
                 seg.labs.append(labs[k][s])
                 seg.logp.append(float(learner_out["lp"][i]))
                 seg.logp_ref.append(float(learner_out["lpr"][i]))
                 seg.value.append(float(learner_out["v"][i]))
         # ---- step every simulator battle; collect the FirstLight battles that have finished their step
         for w in fl_idle:
-            flv.send_step(w, [labs[ns + w]], [nxt[ns + w]])
+            flv.send_step(w, [labs[k] for k in fl_battles(w)], [nxt[k] for k in fl_battles(w)])
         fl_busy += fl_idle
         res = list(enumerate(vec.step([(labs[k][0], labs[k][1]) for k in range(ns)], nxt[:ns])))
         fl_idle = flv.ready(fl_busy, 0.0 if ns else None) if fl_busy else []
         fl_busy = [w for w in fl_busy if w not in fl_idle]
-        res += [(ns + w, flv.recv_step(w)[0]) for w in fl_idle]
+        res += [(k, r) for w in fl_idle for k, r in zip(fl_battles(w), flv.recv_step(w))]
         steps += 1
         for k, (o2, rew, done, info) in res:
             m = metas[k]
@@ -385,7 +393,6 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
                 if m["opp"] != "self" and not m["opp"].startswith("fl:"):
                     league.report(m["opp"], m["opp_deck"], score)
                 ep_stats.append({"opp": m["opp"], "score": score, "ticks": info["ticks"],
-                                 "decisions": info["steps"] * len(m["learners"]),
                                  "plays": info["plays"][ls], "opp_plays": info["plays"][1 - ls],
                                  "first_play": info["first_play"][ls], "overflow": info["overflow"][ls],
                                  "trade": info["elixir_trade"][ls], "delay": m.get("delay", 0)})
@@ -409,9 +416,12 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
             (rd / "actor_heartbeat").write_text(str(now))
         if now - t_metric > 300 and ep_stats:
             t_metric = now
-            append_jsonl(rd / "actor_metrics.jsonl", dict(_episode_summary(ep_stats, version, decisions),
-                                                          fl_aborted=n_aborted))
-            ep_stats = []
+            total = max(1, sum(step_by.values()))
+            append_jsonl(rd / "actor_metrics.jsonl", dict(
+                _episode_summary(ep_stats, version, decisions), fl_aborted=n_aborted,
+                # share of the learner's training decisions collected in this window, by opponent
+                decision_share={k: round(v / total, 3) for k, v in sorted(step_by.items())}))
+            ep_stats, step_by = [], {}
         if now - t_league > 120:
             t_league = now
             league.save()
@@ -422,24 +432,22 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
         flv.close()
 
 
+def _opp_kind(opp: str) -> str:
+    if opp.startswith(("standin:", "fl:")) or opp == "bc:A2":
+        return opp
+    return opp.split(":")[0]
+
+
 def _episode_summary(eps: list[dict], version: int, decisions: int) -> dict:
     by: dict[str, list[float]] = {}
-    dec: dict[str, float] = {}
     for e in eps:
-        kind = e["opp"].split(":")[0] if e["opp"] != "self" else "self"
-        if e["opp"].startswith(("standin:", "fl:")) or e["opp"] == "bc:A2":
-            kind = e["opp"]
-        by.setdefault(kind, []).append(e["score"])
-        dec[kind] = dec.get(kind, 0.0) + e.get("decisions", 0)
-    total = max(1.0, sum(dec.values()))
+        by.setdefault(_opp_kind(e["opp"]), []).append(e["score"])
     wins = [e for e in eps if e["score"] == 1.0]
     passive = sum(1 for e in wins if e["opp_plays"] <= 3)
     first = [e["first_play"] * 0.05 for e in eps if e["first_play"] >= 0]
     return {
         "time": time.time(), "version": version, "decisions": decisions, "episodes": len(eps),
         "score_by_opponent": {k: (round(float(np.mean(v)), 3), len(v)) for k, v in by.items()},
-        # share of the learner's training decisions from games that ended in this window
-        "decision_share": {k: round(v / total, 3) for k, v in sorted(dec.items())},
         "plays_per_game": float(np.mean([e["plays"] for e in eps])),
         "first_play_s": float(np.mean(first)) if first else None,
         "wins_vs_passive_share": passive / max(1, len(wins)),
