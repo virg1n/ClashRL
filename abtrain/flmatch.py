@@ -118,7 +118,7 @@ def _fl_policy(name: str):
 class OurSeat:
     """One of our checkpoints on one seat: decides every 5 ticks, sends each play at its delay tick."""
 
-    def __init__(self, team: int, model, view, decode: str):
+    def __init__(self, team: int, model, view, decode: str, blind: float = 0.0, rng=None):
         import torch
 
         from .model import DECODES
@@ -127,17 +127,21 @@ class OurSeat:
         self.dec = DECODES[decode]
         self.dev = next(model.parameters()).device
         self.state = model.initial_state(1, self.dev)
-        self.queue: list[tuple[int, object]] = []
-        self.stats = {"plays": 0, "first_play_tick": None, "curve": []}  # curve: (tick, P(win), P(loss))
+        self.queue: list[tuple[int, object, int | None]] = []  # (send tick, command, card it was chosen for)
+        self.blind, self.rng = blind, rng
+        self.stats = {"plays": 0, "first_play_tick": None, "stale": 0, "curve": []}  # curve: (tick, P(win), P(loss))
         self.torch = torch
 
     def act(self, tick: int, state) -> list:
-        from .game import DT, HAND, command, legal_masks
+        from .game import DT, HAND, command, drop_inputs, legal_masks
         from .vec import batch_obs
 
         if tick % DT == 0:
-            cand, tiles = legal_masks(_W["parser"], state, self.team)
-            o = self.view.build(state, cand, tiles)
+            seen = self.view.seen(state)  # the live state unless this seat lags
+            cand, tiles = legal_masks(_W["parser"], seen, self.team)
+            o = self.view.build(seen, cand, tiles)
+            if self.blind > 0:
+                drop_inputs(o, self.rng, self.blind)
             for k in ("ent_f", "glob", "cardf", "priv_f"):  # the float16 rounding training saw
                 setattr(o, k, getattr(o, k).astype(np.float16).astype(np.float32))
             with self.torch.no_grad(), self.torch.autocast(device_type=self.dev.type, dtype=self.torch.bfloat16,
@@ -150,9 +154,16 @@ class OurSeat:
                 c, t, d = lab[3 * j : 3 * j + 3]
                 if c < 0 or (c < HAND and t < 0):
                     continue
-                self.queue.append((tick + max(0, min(int(d), DT - 1)), command(self.team, c, t)))
-        out = [c for due, c in self.queue if due <= tick]
-        self.queue = [(due, c) for due, c in self.queue if due > tick]
+                card = int(seen.players[self.team].hand[c]) if self.view.lag and c < HAND else None
+                self.queue.append((tick + max(0, min(int(d), DT - 1)), command(self.team, c, t), card))
+        out = []
+        for _due, c, card in (q for q in self.queue if q[0] <= tick):
+            # as in env.Battle._due: the slot of a card played since holds another card now
+            if card is not None and state.players[self.team].hand[c.hand_slot] != card:
+                self.stats["stale"] += 1
+            else:
+                out.append(c)
+        self.queue = [q for q in self.queue if q[0] > tick]
         return out
 
     def end(self):
@@ -194,7 +205,8 @@ class FLSeat:
 
 def play_game(task: dict) -> dict:
     """task: seed, decks [key0, key1], sides [side0, side1] with side = {"kind": "ours", "path",
-    "decode"} or {"kind": "fl", "name", "sample", "force_first", "record": tag or None}."""
+    "decode", optional "delay", "lag", "blind"} or {"kind": "fl", "name", "sample", "force_first",
+    "record": tag or None}."""
     from flport.observation import Scene
     from royalegym.protocol import HAND_SIZE, DeployStatus, MatchSetup, ShuffleMode
 
@@ -214,7 +226,8 @@ def play_game(task: dict) -> dict:
     # accepted now and runs later; FirstLight's scene and our views see it when it runs.
     dly = [0, 0]
     for t in (0, 1):
-        dly[t] = int(task.get("fl_delay" if task["sides"][t]["kind"] == "fl" else "delay", 0))
+        sd = task["sides"][t]
+        dly[t] = int(sd.get("delay", task.get("fl_delay" if sd["kind"] == "fl" else "delay", 0)))
     if hasattr(eng, "set_command_delay_ticks"):
         eng.set_command_delay_ticks(tuple(dly) if any(dly) else 0)
     elif any(dly):
@@ -238,9 +251,10 @@ def play_game(task: dict) -> dict:
         sd = task["sides"][t]
         if sd["kind"] == "ours" or sd.get("record"):
             views[t] = SeatView(cat, parser)
-            views[t].reset(t, decks[t], forms[t], decks[1 - t], delay_ticks=dly[t])
+            views[t].reset(t, decks[t], forms[t], decks[1 - t], delay_ticks=dly[t], lag_ticks=int(sd.get("lag", 0)))
         if sd["kind"] == "ours":
-            seats.append(OurSeat(t, _ours(sd["path"]), views[t], sd.get("decode", "t05")))
+            seats.append(OurSeat(t, _ours(sd["path"]), views[t], sd.get("decode", "t05"), float(sd.get("blind", 0.0)),
+                                 np.random.default_rng(seed + t)))
         else:
             seats.append(FLSeat(t, sd["name"], scene, bool(sd.get("sample")), bool(sd.get("force_first"))))
             if sd.get("record"):
@@ -269,7 +283,7 @@ def play_game(task: dict) -> dict:
             played.append((run_tick, team, card, code, x, y))
             for v in views:
                 if v is not None:
-                    v.note_play(team, card)
+                    v.note_play(team, card, run_tick)
             if isinstance(seats[team], OurSeat):
                 st = seats[team].stats
                 st["plays"] += 1
@@ -515,8 +529,9 @@ def summarize(results: list[dict]) -> dict:
             "error_sample": next((r["error"] for r in results if "error" in r), None)}
 
 
-def ours(path: str, decode: str = "t05") -> dict:
-    return {"kind": "ours", "path": str(path), "decode": decode}
+def ours(path: str, decode: str = "t05", **handicap) -> dict:
+    """``handicap``: optional ``delay``, ``lag`` (ticks) and ``blind`` (see ``env.SeatSpec``)."""
+    return {"kind": "ours", "path": str(path), "decode": decode, **handicap}
 
 
 def fl(name: str, sample: bool = False, force_first: bool = False, record: str | None = None) -> dict:

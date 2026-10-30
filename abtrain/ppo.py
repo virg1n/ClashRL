@@ -137,7 +137,7 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
     import torch
 
     from .env import BattleSpec, SeatSpec
-    from .game import Catalog, make_engine
+    from .game import DT, Catalog, make_engine
     from .league import League
     from .model import build_model
     from .shards import concat_sequences, pack_rows
@@ -154,6 +154,10 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
     cat = Catalog.build(make_engine())
     seed = int(time.time()) % 100000
     phase2 = run == "A" and cfg["a_phase"] >= 2
+    phase3 = run == "A" and cfg["a_phase"] >= 3
+    if cfg["a3_obs_lag_ticks"] % DT:
+        raise SystemExit(f"a3_obs_lag_ticks must be a multiple of {DT}")
+    handicap = dict(delay=cfg["a3_cmd_delay_ticks"], lag=cfg["a3_obs_lag_ticks"], blind=cfg["a3_blind"])
     league = League(run, cat, seed, mix=cfg["a_mix"] if phase2 else None)
     rng = np.random.default_rng(seed + 17)
     rcfg = dict(gamma=cfg["ppo_gamma"], shaping=cfg["shaping_coef"], personal=cfg["overflow_personal"],
@@ -211,10 +215,14 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
         decks[ls] = league.decks.dealt(m["decks"][0])
         decks[1 - ls] = league.decks.dealt(m["decks"][1])
         learners = {0, 1} if m["opp"] == "self" else {ls}
-        seats = tuple(SeatSpec(decks[s], elixir_shaping=(run == "B" and s in learners)) for s in (0, 1))
+        # A phase 3: this model's seats and its own past versions carry the handicap; the
+        # FirstLight models, the BC model and the undelayed best A do not
+        past_self = m["opp"].startswith(("snap:A:", "promoted:A_"))
+        seats = tuple(SeatSpec(decks[s], elixir_shaping=(run == "B" and s in learners),
+                               **(handicap if phase3 and (s in learners or past_self) else {})) for s in (0, 1))
         delay = delay_for(run, decisions, cfg, rng)
         meta = {"opp": m["opp"], "learner_seat": ls, "learners": sorted(learners), "opp_deck": m["decks"][1],
-                "own_deck": m["decks"][0], "delay": delay}
+                "own_deck": m["decks"][0], "delay": handicap["delay"] if phase3 else delay}
         if m["opp"].startswith("fl:"):
             meta["fl"] = m["opp"][3:]
         return BattleSpec(seats, delay=delay, seed=int(rng.integers(2**62)), feature_drop=0.1, meta=meta)
@@ -395,7 +403,8 @@ def actor_main(run: str, gpu: int, cores: list[int], init: str, stop, fl_workers
                 ep_stats.append({"opp": m["opp"], "score": score, "ticks": info["ticks"],
                                  "plays": info["plays"][ls], "opp_plays": info["plays"][1 - ls],
                                  "first_play": info["first_play"][ls], "overflow": info["overflow"][ls],
-                                 "trade": info["elixir_trade"][ls], "delay": m.get("delay", 0)})
+                                 "trade": info["elixir_trade"][ls], "delay": m.get("delay", 0),
+                                 "refused": info["refused"][ls]})
                 H[k] = 0
                 C[k] = 0
                 HR[k] = 0
@@ -455,6 +464,7 @@ def _episode_summary(eps: list[dict], version: int, decisions: int) -> dict:
         "elixir_trade": float(np.mean([e["trade"] for e in eps])),
         "game_s": float(np.mean([e["ticks"] for e in eps])) * 0.05,
         "delay_ticks": float(np.mean([e["delay"] for e in eps])),
+        "refused_per_game": float(np.mean([e["refused"] for e in eps])),
     }
 
 

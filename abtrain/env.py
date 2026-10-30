@@ -17,23 +17,25 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .game import (DT, ELIXIR_TICKS, HAND, Catalog, Obs, SeatView, command, elixir_balance,
-                   legal_masks, make_engine, make_parser, potential)
+from .game import (DT, ELIXIR_TICKS, HAND, TARGET_COLS, Catalog, Obs, SeatView, command, drop_inputs,
+                   elixir_balance, legal_masks, make_engine, make_parser, potential)
 
 MAX_TICKS = 12000
-_TGT_COLS = (16, 17, 18, 19, 20, 39, 40, 41, 45)
 
 
 @dataclass
 class SeatSpec:
     deck: list  # 8 (name, form) in dealt order
     elixir_shaping: bool = False
+    delay: int | None = None  # this seat's command delay, ticks; None = the battle's
+    lag: int = 0  # it sees the state this many ticks ago (a multiple of DT)
+    blind: float = 0.0  # game.drop_inputs for this seat, instead of the battle's feature_drop
 
 
 @dataclass
 class BattleSpec:
     seats: tuple  # (SeatSpec, SeatSpec)
-    delay: int = 0  # command delay in ticks, both seats
+    delay: int = 0  # command delay in ticks, seats without their own
     seed: int = 0
     feature_drop: float = 0.0
     meta: dict = field(default_factory=dict)  # opaque, returned with the result
@@ -66,13 +68,16 @@ class Battle:
 
         self.spec = spec
         self.rng = np.random.default_rng(spec.seed)
+        self.delays = tuple(int(spec.delay if s.delay is None else s.delay) for s in spec.seats)
         if hasattr(self.engine, "set_command_delay_ticks"):
-            self.engine.set_command_delay_ticks(int(spec.delay))
+            self.engine.set_command_delay_ticks(self.delays)
         decks = [[self.cat.ids[n] for n, _ in s.deck] for s in spec.seats]
         forms = [[f for _, f in s.deck] for s in spec.seats]
         self.engine.reset(int(spec.seed) & (2**63 - 1), MatchSetup(decks=decks, forms=forms, shuffle=ShuffleMode.NONE))
         for s in (0, 1):
-            self.views[s].reset(s, decks[s], forms[s], decks[1 - s], delay_ticks=spec.delay)
+            self.views[s].reset(s, decks[s], forms[s], decks[1 - s], delay_ticks=self.delays[s],
+                                lag_ticks=spec.seats[s].lag)
+        self.seen_hand = [None, None]  # the hand a lagging seat's decision was made from
         self.state = self.engine.state()
         self.phi = [potential(self.state, s) for s in (0, 1)]
         self.ebal = [elixir_balance(self.cat, self.state, s) for s in (0, 1)]
@@ -89,15 +94,21 @@ class Battle:
             if s not in self.observed:
                 out.append(None)
                 continue
-            cand, tiles = legal_masks(self.parser, self.state, s)
-            o = self.views[s].build(self.state, cand, tiles)
-            if self.spec.feature_drop > 0 and len(o.ent_ids):
+            seat = self.spec.seats[s]
+            st = self.views[s].seen(self.state)
+            cand, tiles = legal_masks(self.parser, st, s)
+            o = self.views[s].build(st, cand, tiles)
+            if seat.lag:
+                self.seen_hand[s] = list(st.players[s].hand)
+            if seat.blind > 0:
+                drop_inputs(o, self.rng, seat.blind)
+            elif self.spec.feature_drop > 0 and len(o.ent_ids):
                 p = self.spec.feature_drop
                 keep = ~((o.ent_ids[:, 2] == 5) & (self.rng.random(len(o.ent_ids)) < p))
                 o.ent_ids, o.ent_f = o.ent_ids[keep], o.ent_f[keep]
                 cut = self.rng.random(len(o.ent_f)) < p
                 if cut.any():
-                    o.ent_f[np.ix_(cut, _TGT_COLS)] = 0.0
+                    o.ent_f[np.ix_(cut, TARGET_COLS)] = 0.0
             out.append(o)
         return out
 
@@ -120,26 +131,43 @@ class Battle:
         self._window(tick0, sends)
         return self._rewards(st0, tick0)
 
+    def _due(self, sends: list, now: int) -> list:
+        """The plays to send at tick ``now``. A lagging seat chose its slot from an old hand: a
+        slot whose card has been played since holds another card now, and the play is refused
+        rather than playing a card the seat never chose."""
+        cmds = [c for t, _, c in sends if t == now]
+        if any(self.seen_hand[c.team] is not None and c.hand_slot < HAND for c in cmds):
+            live = self.engine.state()
+            out = []
+            for c in cmds:
+                seen = self.seen_hand[c.team]
+                if seen is not None and c.hand_slot < HAND and live.players[c.team].hand[c.hand_slot] != seen[c.hand_slot]:
+                    self.stats["refused"][c.team] += 1
+                else:
+                    out.append(c)
+            return out
+        return cmds
+
     def _window(self, tick0: int, sends: list) -> None:
         """Run the DT ticks of one decision window, sending each play at its tick."""
         from royalegym.protocol import DeployStatus
 
-        delayed = self.engine.command_delay_ticks != (0, 0) if hasattr(self.engine, "command_delay_ticks") else False
         for k in range(DT):
             now = tick0 + k
-            cmds = [c for t, _, c in sends if t == now]
-            hands = [list(self.state.players[s].hand) for s in (0, 1)] if cmds else None
+            cmds = self._due(sends, now)
+            live = self.engine.state() if cmds else None
+            hands = [list(live.players[s].hand) for s in (0, 1)] if cmds else None
             results = self.engine.step(cmds, 1)
-            if delayed:
-                for _t, team, kind, what, reason in (self.engine.step_commands_run() or []):
+            if any(self.delays):
+                for run_tick, team, kind, what, reason in (self.engine.step_commands_run() or []):
                     if reason == 0 and kind == "deploy":
-                        self._ran(team, what)
+                        self._ran(team, what, run_tick)
             for c, r in zip(cmds, results):
                 if r.status != DeployStatus.OK:
                     self.stats["refused"][c.team] += 1
                     continue
-                if not delayed and c.hand_slot < HAND:
-                    self._ran(c.team, hands[c.team][c.hand_slot])
+                if not self.delays[c.team] and c.hand_slot < HAND:
+                    self._ran(c.team, hands[c.team][c.hand_slot], now)
             if cmds or k == DT - 1:
                 self.state = self.engine.state()
             if self.state.game_over:
@@ -194,11 +222,11 @@ class Battle:
             return None, rewards, True, info
         return self._observe(), rewards, False, info
 
-    def _ran(self, team: int, card_id: int) -> None:
+    def _ran(self, team: int, card_id: int, tick: int) -> None:
         if card_id is None or card_id < 0:
             return
         for v in self.views:
-            v.note_play(team, card_id)
+            v.note_play(team, card_id, tick)
         self.stats["plays"][team] += 1
         if self.stats["first_play"][team] < 0:
             self.stats["first_play"][team] = int(self.state.tick)

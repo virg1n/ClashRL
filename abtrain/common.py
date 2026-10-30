@@ -47,8 +47,16 @@ DEFAULTS: dict[str, Any] = {
     # 0.73 vs FirstLight General) at delay 0, against the real FirstLight models, on all GPUs; B
     # paused. The first supervisor start with a_phase 2 archives phase 1's A run (WORK/archive) and
     # starts a new clock: the pipeline then stops a_phase_hours after that start.
-    "a_phase": 2,
+    # A, phase 3 (Da 2026-10-30): PPO again from the best A, now with live-like handicaps on this
+    # model's seats: it sees the state a3_obs_lag_ticks ago, its plays take a3_cmd_delay_ticks, and
+    # each listed input is missing with probability a3_blind. Started and archived like phase 2.
+    "a_phase": 3,
     "a_phase_hours": 72.0,
+    "a3_obs_lag_ticks": 10,  # 500 ms, a multiple of the 5-tick decision window
+    "a3_cmd_delay_ticks": 4,  # 200 ms
+    "a3_blind": 0.5,
+    "a3_eval_best_games": 60,  # vs the best A without any handicap
+    "a3_eval_fl_games": 30,  # vs FirstLight General
     "run_B": False,  # B's PPO (paused in A's phase 2)
     "a_mix": {"fl_general": 0.2, "fl_hog2": 0.1, "self": 0.25, "past": 0.25, "bc": 0.1, "hard": 0.1},
     # stage 0 extraction

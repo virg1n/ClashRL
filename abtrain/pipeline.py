@@ -141,6 +141,8 @@ class Supervisor:
         self.state["last_start"] = time.time()
         if self.cfg["a_phase"] >= 2 and self.state.get("a_phase", 1) < 2:
             self.enter_a_phase2()
+        if self.cfg["a_phase"] >= 3 and self.state.get("a_phase", 1) == 2:
+            self.enter_a_phase3()
         if self.state.get("a_phase_started") is not None:
             self.deadline = self.state["a_phase_started"] + self.cfg["a_phase_hours"] * 3600
         else:
@@ -180,6 +182,40 @@ class Supervisor:
         self.state.update(a_phase=2, a_phase_started=time.time(), a_init=str(init), a_phase1_archive=str(arch))
         self.save_state()
         log(f"A phase 2: phase 1's A run archived to {arch}; PPO starts from {init} "
+            f"({info.get('win_rate')} vs FirstLight General over {info.get('games')} games)", NAME)
+
+    def enter_a_phase3(self):
+        """Archive phase 2's A run and start phase 3 (handicapped) from the best A (once). The
+        best stays in the league without a handicap: it is also what phase 3 is measured against."""
+        best = CKPT / "A" / "best_vs_general.pt"
+        if not best.exists():
+            log(f"A phase 3 needs {best}; staying in phase 2", NAME)
+            return
+        reap_stale()
+        init = CKPT / "A" / "phase3_init.pt"
+        info = read_json(best.with_suffix(".json"), None) or torch_load(best).get("eval") or {}
+        if not init.exists():  # PPO start, KL reference and evaluation opponent: never overwritten
+            shutil.copyfile(best, init.with_name(".phase3_init.tmp"))
+            os.replace(init.with_name(".phase3_init.tmp"), init)
+            atomic_write_json(init.with_suffix(".json"), {**info, "copied_from": str(best), "time": time.time()})
+        arch = WORK / "archive" / f"a_phase2_{time.strftime('%Y%m%d_%H%M%S')}"
+        arch.mkdir(parents=True, exist_ok=True)
+        for src, name in ((RUNS / "ppo_A", "ppo_A"), (RUNS / "A", "league_state_A"), (LEAGUE / "A", "league_A"),
+                          (RUNS / "eval" / "A.jsonl", "eval_A.jsonl"), (RUNS / "eval" / "A_state.json", "eval_A_state.json"),
+                          (RUNS / "eval" / "DONE", "eval_DONE")):
+            if src.exists():
+                shutil.move(str(src), str(arch / name))
+        shutil.rmtree(SHM / "ppo_A", ignore_errors=True)
+        (LEAGUE / "promoted").mkdir(parents=True, exist_ok=True)
+        for old in (LEAGUE / "promoted").glob("A_*.pt"):  # the same model as the copy below
+            old.unlink(missing_ok=True)
+        league_copy(init, LEAGUE / "promoted" / "nodelay_best.pt")
+        for stage in ("ppo_A", "evaluator"):
+            self.state["stages"].pop(stage, None)
+        self.state.pop("aborted", None)
+        self.state.update(a_phase=3, a_phase_started=time.time(), a_init=str(init), a_phase2_archive=str(arch))
+        self.save_state()
+        log(f"A phase 3: phase 2's A run archived to {arch}; PPO starts from {init} "
             f"({info.get('win_rate')} vs FirstLight General over {info.get('games')} games)", NAME)
 
     # ---------------------------------------------------------------- state
@@ -814,7 +850,7 @@ def write_status(sup: Supervisor | None = None) -> str:
     deadline = deadline_ts()
     lines = [f"# A/B training status ({time.strftime('%Y-%m-%d %H:%M:%S')})", "",
              f"Started {time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}"
-             + (f", A phase 2 since {time.strftime('%Y-%m-%d %H:%M', time.localtime(st['a_phase_started']))}"
+             + (f", A phase {st.get('a_phase')} since {time.strftime('%Y-%m-%d %H:%M', time.localtime(st['a_phase_started']))}"
                 if st.get("a_phase_started") else "")
              + (", B paused" if not cfg["run_B"] else "") + ", deadline "
              f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))} ({(deadline - time.time()) / 3600:.1f} h left), "
@@ -856,7 +892,8 @@ def write_status(sup: Supervisor | None = None) -> str:
         if am:
             lines.append(f"  - games: score by opponent {am.get('score_by_opponent')}, plays/game "
                          f"{am.get('plays_per_game', 0):.1f}, first play {am.get('first_play_s')}, wins vs passive "
-                         f"{am.get('wins_vs_passive_share', 0):.2f}, delay {am.get('delay_ticks', 0):.1f} ticks")
+                         f"{am.get('wins_vs_passive_share', 0):.2f}, delay {am.get('delay_ticks', 0):.1f} ticks, "
+                         f"refused plays/game {am.get('refused_per_game', 0):.1f}")
     lines += ["", "## Against the real FirstLight General", ""]
     cur = read_json(RUNS / "eval" / "current.json", None)
     if cur and not (RUNS / "eval" / "DONE").exists():

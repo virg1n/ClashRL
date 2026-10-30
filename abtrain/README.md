@@ -83,6 +83,31 @@ snapshot, 0.73 vs FL General over 200 argmax games):
   suite; phase 1's best (0.73 over 200 games) is the bar to beat. The start checkpoint is
   screened once (label `phase2_start`) for comparison.
 
+## A, phase 3 (delayed; current)
+
+Phase 3 (`a_phase: 3`, the default) trains a live-like version from the best A. The first
+supervisor start archives phase 2's run to `archive/a_phase2_<time>/`, copies
+`checkpoints/A/best_vs_general.pt` to `checkpoints/A/phase3_init.pt` (PPO start, KL reference and
+evaluation opponent) and starts a new `a_phase_hours` clock. GPUs and cores as in phase 2.
+
+This model's seats carry three handicaps, in training and in every evaluation game:
+
+- It sees the state from 500 ms ago (`a3_obs_lag_ticks`: 10): the whole observation, including
+  its own hand, elixir and legal moves, and the opponent's plays.
+- Its plays take 200 ms to run (`a3_cmd_delay_ticks`: 4), on top of the late state.
+- Each decision, each projectile in flight, active spell, unit's attack target, unit's shield
+  and unit's effects (stun, knockback, buffs) is missing with probability 0.5 (`a3_blind`).
+
+A play from a slot whose card has been played since the state it saw is refused (the card it
+chose is gone); `STATUS.md` shows refused plays per game. Opponents keep phase 2's `a_mix`. A's own
+snapshots and promoted versions play with the handicap; FirstLight, the BC model, B's snapshots and
+the undelayed best (`league/promoted/nodelay_best.pt`) play without it.
+
+Each new snapshot is screened with 60 games vs the undelayed best and 30 vs FirstLight General,
+on `mixed`'s decks, all argmax. The score is the win rate over those 90 games, and a higher score
+than the best so far is promoted to `checkpoints/A/best_delayed.pt`, without extra games, so
+expect some selection noise. `phase3_start` (the start checkpoint with the handicaps) is the bar.
+
 ## Where results land
 
 | Path (under `AB_WORK`) | What |
@@ -92,6 +117,8 @@ snapshot, 0.73 vs FL General over 200 argmax games):
 | `checkpoints/A/bc_stage2_human_only.pt` | **stage 2, human matches only, before any PPO or FirstLight exposure. Never overwritten (read-only). Model D reuses its win-prob head.** |
 | `checkpoints/B/bc_stage2_human_only.pt` | B's stage 2 (Hog 2.6 human matches) |
 | `checkpoints/{A,B}/best_vs_general.pt` (+ `.json`) | best promoted PPO snapshot vs FL General, with its numbers and chosen decoding |
+| `checkpoints/A/best_delayed.pt` (+ `.json`) | phase 3: best promoted snapshot with the handicaps |
+| `checkpoints/A/phase3_init.pt` | phase 3: its start, the best A without delay |
 | `checkpoints/{A,B}/ppo_final.pt` | last PPO weights |
 | `runs/eval/{A,B}.jsonl`, `runs/eval/fl_baseline.json` | every screen vs FL General; the FL Hog 2 baseline |
 | `runs/ppo_{A,B}/learner_metrics.jsonl`, `actor_metrics.jsonl` | PPO curves, games by opponent, anti-passivity |

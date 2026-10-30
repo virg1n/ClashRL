@@ -13,6 +13,7 @@ Action (FirstLight V4 style, one decision per 250 ms = 5 engine ticks):
 from __future__ import annotations
 
 import functools
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -173,6 +174,9 @@ def sanitize_forms(cat: Catalog, deck: list[tuple[str, int]]) -> list[tuple[str,
 _STATUS_BITS = (1, 2, 4, 8, 16, 32, 64, 128)
 _UNVALIDATED_STATUS = (32,)  # st_windup
 ELIXIR_TICKS = 56  # ticks per elixir at 1x (2.8 s)
+TARGET_COLS = (16, 17, 18, 19, 20, 39, 40, 41, 45)  # who a unit or projectile is aiming at
+SHIELD_COLS = (5,)
+EFFECT_COLS = (10, 11, 44)  # stunned, knockback, number of buffs
 
 
 @dataclass
@@ -188,6 +192,21 @@ class Obs:
     tiles: np.ndarray  # [HAND, NT] bool, legal tiles per hand slot
     cand_cost: np.ndarray  # [NCAND] f32 elixir cost of each candidate now
     elixir: float = 0.0  # exact own elixir (milli-elixir / 1000) for the affordability rule
+
+
+def drop_inputs(o: Obs, rng: np.random.Generator, p: float) -> None:
+    """Missing inputs (A phase 3), each with probability ``p``, per item and decision: every
+    projectile in flight and every active spell, and per unit its attack target, its shield and
+    its effects."""
+    if not len(o.ent_ids):
+        return
+    kind = o.ent_ids[:, 2]
+    keep = ~(((kind == KIND_SPELL) | (kind == KIND_PROJECTILE)) & (rng.random(len(kind)) < p))
+    o.ent_ids, o.ent_f = o.ent_ids[keep], o.ent_f[keep]
+    for cols in (TARGET_COLS, SHIELD_COLS, EFFECT_COLS):
+        cut = rng.random(len(o.ent_f)) < p
+        if cut.any():
+            o.ent_f[np.ix_(cut, cols)] = 0.0
 
 
 def legal_masks(parser, state, team) -> tuple[np.ndarray, np.ndarray]:
@@ -225,7 +244,7 @@ class SeatView:
         self.seat = 0
 
     def reset(self, seat: int, own_deck: list[int], own_forms: list[int], opp_deck: list[int],
-              start_elixir: float = 6.0, delay_ticks: int = 0) -> None:
+              start_elixir: float = 6.0, delay_ticks: int = 0, lag_ticks: int = 0) -> None:
         self.seat = seat
         self.queue = list(own_deck)  # own deal order; a played card goes to the back
         self.forms = {c: f for c, f in zip(own_deck, own_forms)}
@@ -236,11 +255,29 @@ class SeatView:
         self.opp_est = float(start_elixir)
         self.last_tick = 0
         self.delay_ticks = int(delay_ticks)
+        self.lag = int(lag_ticks)  # this seat sees everything this many ticks late
+        self.past: deque = deque()
+        self.held: list[tuple[int, int, int]] = []
+
+    def seen(self, st):
+        """The state this seat sees now, given the live one; call once per decision."""
+        if not self.lag:
+            return st
+        self.past.append(st)
+        while len(self.past) > 1 and int(self.past[1].tick) <= int(st.tick) - self.lag:
+            self.past.popleft()
+        return self.past[0]
 
     # public events: a play that RAN (its unit/spell appeared), seen by both seats
-    def note_play(self, team: int, card_id: int) -> None:
+    def note_play(self, team: int, card_id: int, tick: int = 0) -> None:
         if card_id < 0:
             return
+        if self.lag:  # reaches this seat together with the state it happened in
+            self.held.append((tick, team, card_id))
+            return
+        self._note(team, card_id)
+
+    def _note(self, team: int, card_id: int) -> None:
         if team == self.seat:
             if card_id in self.queue:
                 self.queue.remove(card_id)
@@ -254,6 +291,10 @@ class SeatView:
         s = self.seat
         flip = s == 1
         tick = int(st.tick)
+        if self.held:
+            for _t, team, card_id in (e for e in self.held if e[0] <= tick):
+                self._note(team, card_id)
+            self.held = [e for e in self.held if e[0] > tick]
         rate = float(st.elixir_rate)
         dticks = max(0, tick - self.last_tick)
         self.last_tick = tick
